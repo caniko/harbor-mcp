@@ -1,0 +1,15 @@
+# SynDB release policy, passed with `--config examples/syndb.toml`.
+#
+# The product version lives in the API crate; CITATION.cff and the Zenodo
+# deposit repeat it, the root CHANGELOG.md describes it, and a repository
+# release covers every path. The Python packages (syndb-client, syndb-nwb,
+# ...) are separate release units.
+
+[[package]]
+id = "cargo:api"
+paths = ["."]
+changelog = "CHANGELOG.md"
+anchors = [{ file = "CITATION.cff", key = "version" }]
+# The API crate is a service, not a library contract: its public surface is
+# the HTTP API in openapi.json, which commits and the changelog describe.
+api_check = false

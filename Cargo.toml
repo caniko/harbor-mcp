@@ -1,0 +1,24 @@
+[package]
+name = "harbor-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Plan and apply semver-correct, dependency-ordered version bumps across Rust and Python repositories, as an MCP server and CLI"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/caniko/harbor-mcp"
+readme = "README.md"
+keywords = ["semver", "release", "mcp", "monorepo"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+pep508_rs = "0.9"
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+toml = "0.9"
+toml_edit = "0.25"
