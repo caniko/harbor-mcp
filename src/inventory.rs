@@ -639,22 +639,33 @@ fn python_targets(
     targets
 }
 
-/// Whether an API checker could compare `package` at `rev`: the Cargo library
-/// or Python importable code it has there.
-pub fn api_target_at(root: &Path, rev: &str, package: &Package) -> bool {
+/// API surfaces `package` had at `rev` (none when nothing was published yet).
+pub fn api_targets_at(root: &Path, rev: &str, package: &Package) -> Vec<ApiTarget> {
     match package.ecosystem {
         Ecosystem::Cargo => {
             let lib = show(root, rev, &package.manifest)
                 .and_then(|text| text.parse::<toml::Table>().ok())
                 .is_some_and(|doc| doc.contains_key("lib"));
-            lib || show(root, rev, &join(&package.dir, "src/lib.rs")).is_some()
+            let had = lib || show(root, rev, &join(&package.dir, "src/lib.rs")).is_some();
+            had.then(|| ApiTarget {
+                search: "lib".into(),
+                import: None,
+            })
+            .into_iter()
+            .collect()
         }
         Ecosystem::Python => show(root, rev, &package.manifest)
             .and_then(|text| text.parse::<toml::Table>().ok())
-            .is_some_and(|doc| {
-                !python_targets(&package.dir, &doc, |path| show(root, rev, path).is_some())
-                    .is_empty()
-            }),
+            .map(|doc| {
+                python_targets(&package.dir, &doc, |path| show(root, rev, path).is_some())
+                    .into_iter()
+                    .map(|(search, import)| ApiTarget {
+                        search,
+                        import: Some(import),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

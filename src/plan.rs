@@ -241,6 +241,17 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
     for i in 0..n {
         unit_released[unit[i]] |= baselines[i] != Baseline::Unreleased;
     }
+    // Whether the package had an API surface at its baseline; the check then
+    // compares the union of that surface and the one at HEAD.
+    let baseline_api: Vec<bool> = pkgs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            baselines[i].rev().is_some_and(|rev| {
+                !inventory::api_targets_at(&ws.repos[p.repo].path, rev, p).is_empty()
+            })
+        })
+        .collect();
 
     // Commits alone cannot show a removed public item: a publishable unit
     // whose API would not be compared must not get a confident plan. A package
@@ -248,15 +259,10 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
     if opts.classify && !opts.api_checks && !opts.allow_unchecked_publishable {
         let mut unchecked = BTreeSet::new();
         for (i, p) in pkgs.iter().enumerate() {
-            if !p.publish || ws.config.package(&p.id).and_then(|c| c.api_check) == Some(false) {
-                continue;
-            }
-            let api = !p.api_targets.is_empty()
-                || p.api_unknown
-                || baselines[i]
-                    .rev()
-                    .is_some_and(|rev| inventory::api_target_at(&ws.repos[p.repo].path, rev, p));
-            if api {
+            let exempt =
+                !p.publish || ws.config.package(&p.id).and_then(|c| c.api_check) == Some(false);
+            let api = !p.api_targets.is_empty() || p.api_unknown || baseline_api[i];
+            if api && !exempt {
                 unchecked.insert(p.id.as_str());
             }
         }
@@ -321,7 +327,10 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
         }
         let api_wanted =
             opts.api_checks && p.publish && config.and_then(|c| c.api_check) != Some(false);
-        if api_wanted && !p.api_targets.is_empty() && signal.level > Level::None {
+        if api_wanted
+            && (!p.api_targets.is_empty() || baseline_api[i])
+            && signal.level > Level::None
+        {
             // The checkers read the working tree; the plan describes HEAD.
             let api = if repo.dirty {
                 Err("the working tree has uncommitted changes".to_owned())

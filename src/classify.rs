@@ -3,7 +3,7 @@
 //! Commits are read as Conventional Commits. API comparison is delegated:
 //! cargo-semver-checks for Cargo libraries, griffe for Python packages.
 
-use crate::inventory::{Ecosystem, Location, Package, git, version_at};
+use crate::inventory::{Ecosystem, Location, Package, api_targets_at, git, version_at};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
@@ -301,10 +301,30 @@ pub fn changelog(text: &str) -> Option<Signal> {
     })
 }
 
-/// Delegate an API comparison against `base`. `Err` explains why none ran.
+/// Delegate an API comparison against `base`, comparing the union of the
+/// surfaces the package had then and has now: a removed surface is breaking,
+/// a new one cannot be. `Err` explains why no comparison ran.
 pub fn api(root: &Path, package: &Package, base: &str) -> Result<Signal, String> {
+    let baseline = api_targets_at(root, base, package);
+    if package.api_targets.is_empty() && baseline.is_empty() {
+        return Err("no API target".into());
+    }
     match package.ecosystem {
         Ecosystem::Cargo => {
+            if package.api_targets.is_empty() {
+                return Ok(Signal {
+                    level: Level::Major,
+                    source: "cargo-semver-checks".into(),
+                    detail: "lib: removed".into(),
+                });
+            }
+            if baseline.is_empty() {
+                return Ok(Signal {
+                    level: Level::None,
+                    source: "cargo-semver-checks".into(),
+                    detail: "lib: new, nothing to compare".into(),
+                });
+            }
             let manifest = root.join(&package.manifest);
             let out = Command::new("cargo")
                 .current_dir(root)
@@ -355,14 +375,39 @@ pub fn api(root: &Path, package: &Package, base: &str) -> Result<Signal, String>
             })
         }
         Ecosystem::Python => {
-            // Every module is checked; the most severe result wins.
+            // Every module present on both sides is checked; one that only
+            // existed at the baseline was removed, and one that is new cannot
+            // break its own baseline. The most severe result wins.
             let mut checked = Vec::new();
             for target in &package.api_targets {
                 let import = target.import.as_deref().ok_or("no import name")?;
-                checked.push((import, griffe(root, base, import, &target.search)?));
+                if baseline.iter().any(|b| b.import.as_deref() == Some(import)) {
+                    checked.push((import, griffe(root, base, import, &target.search)?));
+                }
+            }
+            for target in &baseline {
+                let import = target.import.as_deref().ok_or("no import name")?;
+                if !package
+                    .api_targets
+                    .iter()
+                    .any(|h| h.import.as_deref() == Some(import))
+                {
+                    checked.push((
+                        import,
+                        Signal {
+                            level: Level::Major,
+                            source: "griffe".into(),
+                            detail: "removed".into(),
+                        },
+                    ));
+                }
             }
             let Some(level) = checked.iter().map(|(_, s)| s.level).max() else {
-                return Err("no API target".into());
+                return Ok(Signal {
+                    level: Level::None,
+                    source: "griffe".into(),
+                    detail: "new modules only, nothing to compare".into(),
+                });
             };
             let detail = if level == Level::None {
                 "no breaking API changes".to_owned()

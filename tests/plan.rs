@@ -63,6 +63,14 @@ fn entry<'a>(plan: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
+fn pyproject(modules: &[&str]) -> String {
+    let list: Vec<String> = modules.iter().map(|m| format!("\"{m}\"")).collect();
+    format!(
+        "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools]\npy-modules = [{}]\n",
+        list.join(", ")
+    )
+}
+
 #[test]
 fn plans_propagates_and_applies() {
     let tmp = std::env::temp_dir().join(format!("harbor-mcp-test-{}", std::process::id()));
@@ -324,6 +332,98 @@ fn refuses_unchecked_publishable_units() {
 }
 
 #[test]
+fn checks_removed_python_modules() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-py-removed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(&tmp, "pyproject.toml", &pyproject(&["alpha", "beta"]));
+    write(&tmp, "alpha.py", "def stable():\n    pass\n");
+    write(&tmp, "beta.py", "def old():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    // The module itself is gone, though py-modules still lists it.
+    std::fs::remove_file(tmp.join("beta.py")).unwrap();
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "fix: drop beta"]);
+    let repo = tmp.to_str().unwrap();
+
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    let shapes = entry(&plan, "pypi:shapes");
+    assert_eq!(shapes["api_checked"], true);
+    assert_eq!(
+        (shapes["level"].as_str(), shapes["next"].as_str()),
+        (Some("major"), Some("2.0.0"))
+    );
+    assert!(
+        shapes["reasons"].to_string().contains("beta: removed"),
+        "{shapes}"
+    );
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn checks_removals_beside_python_module_additions() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-py-added-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(&tmp, "pyproject.toml", &pyproject(&["alpha", "beta"]));
+    write(
+        &tmp,
+        "alpha.py",
+        "def old():\n    pass\n\ndef keep():\n    pass\n",
+    );
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    // One module loses a public name while another is added: the addition
+    // must not make the comparison fail.
+    write(&tmp, "alpha.py", "def keep():\n    pass\n");
+    write(&tmp, "beta.py", "def fresh():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "fix: reshape alpha"]);
+    let repo = tmp.to_str().unwrap();
+
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    let shapes = entry(&plan, "pypi:shapes");
+    assert_eq!(shapes["api_checked"], true);
+    assert_eq!(
+        (shapes["level"].as_str(), shapes["next"].as_str()),
+        (Some("major"), Some("2.0.0"))
+    );
+    assert!(shapes["reasons"].to_string().contains("alpha:"), "{shapes}");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn checks_python_module_additions_without_breaking() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-py-new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(&tmp, "pyproject.toml", &pyproject(&["alpha", "beta"]));
+    write(&tmp, "alpha.py", "def stable():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    write(&tmp, "beta.py", "def fresh():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: add beta"]);
+    let repo = tmp.to_str().unwrap();
+
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    let shapes = entry(&plan, "pypi:shapes");
+    assert_eq!(shapes["api_checked"], true);
+    assert_eq!(
+        (shapes["level"].as_str(), shapes["next"].as_str()),
+        (Some("minor"), Some("1.1.0"))
+    );
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
 fn plans_from_an_explicit_base() {
     let tmp = std::env::temp_dir().join(format!("harbor-mcp-base-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -468,6 +568,15 @@ fn refuses_publishable_units_that_lost_their_api() {
 
     let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
     assert!(err.contains("cargo:widget"), "{err}");
+    // With checks on, the library that was released is gone: breaking.
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    let widget = entry(&plan, "cargo:widget");
+    assert_eq!(widget["api_checked"], true);
+    assert_eq!(
+        (widget["level"].as_str(), widget["next"].as_str()),
+        (Some("major"), Some("2.0.0"))
+    );
+    assert!(widget["reasons"].to_string().contains("lib: removed"));
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
@@ -541,11 +650,7 @@ fn checks_every_python_module() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     git(&tmp, &["init", "-q", "-b", "trunk"]);
-    write(
-        &tmp,
-        "pyproject.toml",
-        "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools]\npy-modules = [\"alpha\", \"beta\"]\n",
-    );
+    write(&tmp, "pyproject.toml", &pyproject(&["alpha", "beta"]));
     write(&tmp, "alpha.py", "def stable():\n    pass\n");
     write(
         &tmp,
