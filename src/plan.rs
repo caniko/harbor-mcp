@@ -522,7 +522,11 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
                     "api_check = false".to_owned()
                 } else if !opts.api_checks {
                     "API checks off".to_owned()
-                } else if p.api_unknown {
+                } else if p.api_unknown
+                    || (p.ecosystem == Ecosystem::Python
+                        && baselines[i].rev().is_some()
+                        && !baseline_api[i])
+                {
                     "layout not recognised".to_owned()
                 } else if p.api_targets.is_empty() {
                     "no API target".to_owned()

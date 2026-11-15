@@ -306,6 +306,9 @@ pub fn changelog(text: &str) -> Option<Signal> {
 /// a new one cannot be. `Err` explains why no comparison ran.
 pub fn api(root: &Path, package: &Package, base: &str) -> Result<Signal, String> {
     let baseline = api_targets_at(root, base, package);
+    if package.ecosystem == Ecosystem::Python && (package.api_unknown || baseline.is_empty()) {
+        return Err("layout not recognised at baseline or HEAD".into());
+    }
     if package.api_targets.is_empty() && baseline.is_empty() {
         return Err("no API target".into());
     }
@@ -381,7 +384,13 @@ pub fn api(root: &Path, package: &Package, base: &str) -> Result<Signal, String>
             let mut checked = Vec::new();
             for target in &package.api_targets {
                 let import = target.import.as_deref().ok_or("no import name")?;
-                if baseline.iter().any(|b| b.import.as_deref() == Some(import)) {
+                if let Some(old) = baseline
+                    .iter()
+                    .find(|b| b.import.as_deref() == Some(import))
+                {
+                    if old.search != target.search {
+                        return Err("Python search path changed".into());
+                    }
                     checked.push((import, griffe(root, base, import, &target.search)?));
                 }
             }
@@ -438,6 +447,8 @@ fn griffe(root: &Path, base: &str, import: &str, search: &str) -> Result<Signal,
             import,
             "--against",
             base,
+            "--base-ref",
+            "HEAD",
             "--search",
             search,
             "--format",

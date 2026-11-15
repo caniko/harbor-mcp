@@ -63,12 +63,177 @@ fn entry<'a>(plan: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
+fn assert_unchecked(repo: &str, ids: &[&str]) {
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    for id in ids {
+        assert_eq!(entry(&plan, id)["api_checked"], false, "{id}: {plan}");
+    }
+}
+
 fn pyproject(modules: &[&str]) -> String {
     let list: Vec<String> = modules.iter().map(|m| format!("\"{m}\"")).collect();
     format!(
         "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools]\npy-modules = [{}]\n",
         list.join(", ")
     )
+}
+
+#[test]
+fn unknown_python_layouts_are_not_checked() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-r3-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    for (case, backend, config, extra) in [
+        ("setupcfg", "setuptools.build_meta", "", "setup.cfg"),
+        ("setuppy", "setuptools.build_meta", "", "setup.py"),
+        ("hatch-default", "hatchling.build", "", ""),
+        (
+            "hatch-force",
+            "hatchling.build",
+            "[tool.hatch.build.targets.wheel]\npackages = [\"src/shapes\"]\nforce-include = { extra = \"extra\" }\n",
+            "",
+        ),
+        (
+            "hatch-build-force",
+            "hatchling.build",
+            "[tool.hatch.build]\nforce-include = { extra = \"extra\" }\n[tool.hatch.build.targets.wheel]\npackages = [\"src/shapes\"]\n",
+            "",
+        ),
+        (
+            "maturin",
+            "maturin",
+            "[tool.maturin]\npython-source = \"src\"\nmodule-name = \"shapes._ext\"\npython-packages = [\"extra\"]\n",
+            "",
+        ),
+        ("flit", "flit_core.buildapi", "", ""),
+        (
+            "subpackage",
+            "setuptools.build_meta",
+            "[tool.setuptools]\npackages = [\"shapes\"]\n",
+            "shapes/extras/__init__.py",
+        ),
+    ] {
+        let dir = tmp.join(case);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "trunk"]);
+        write(
+            &dir,
+            "pyproject.toml",
+            &format!(
+                "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n[build-system]\nrequires = []\nbuild-backend = \"{backend}\"\n{config}"
+            ),
+        );
+        write(&dir, "shapes/__init__.py", "def old(): pass\n");
+        write(&dir, "src/shapes/__init__.py", "def old(): pass\n");
+        if !extra.is_empty() {
+            write(
+                &dir,
+                extra,
+                if extra == "setup.cfg" {
+                    "[options]\npackages = shapes\n"
+                } else {
+                    ""
+                },
+            );
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "feat: initial"]);
+        git(&dir, &["tag", "v1.0.0"]);
+        write(&dir, "shapes/__init__.py", "def keep(): pass\n");
+        git(&dir, &["commit", "-qam", "fix: change"]);
+        let repo = dir.to_str().unwrap();
+        assert!(
+            harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"])
+                .contains("pypi:shapes")
+        );
+        let plan: Value =
+            serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+        assert_eq!(
+            entry(&plan, "pypi:shapes")["api_checked"],
+            false,
+            "{case}: {plan}"
+        );
+        assert_eq!(
+            entry(&plan, "pypi:shapes")["api_unchecked"],
+            "layout not recognised",
+            "{case}: {plan}"
+        );
+    }
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn unknown_python_revision_is_not_an_empty_api() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-r3-revisions-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let header = "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n[build-system]\nrequires = []\nbuild-backend = \"setuptools.build_meta\"\n";
+    let known = format!("{header}[tool.setuptools]\npackages = [\"shapes\"]\n");
+    let unknown = format!("{header}[tool.setuptools.packages.find]\nwhere = [\".\"]\n");
+    for (case, before, after) in [
+        ("known-to-unknown", &known, &unknown),
+        ("unknown-to-known", &unknown, &known),
+    ] {
+        let dir = tmp.join(case);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "trunk"]);
+        write(&dir, "pyproject.toml", before);
+        write(&dir, "shapes/__init__.py", "def old(): pass\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "feat: initial"]);
+        git(&dir, &["tag", "v1.0.0"]);
+        write(&dir, "pyproject.toml", after);
+        git(&dir, &["commit", "-qam", "fix: change layout"]);
+        let repo = dir.to_str().unwrap();
+        assert!(
+            harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"])
+                .contains("pypi:shapes")
+        );
+        let plan: Value =
+            serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+        assert_eq!(
+            entry(&plan, "pypi:shapes")["api_checked"],
+            false,
+            "{case}: {plan}"
+        );
+        assert_eq!(
+            entry(&plan, "pypi:shapes")["api_unchecked"],
+            "layout not recognised",
+            "{case}: {plan}"
+        );
+    }
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn ignores_root_shadow_when_checking_declared_search_path() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-r3-shadow-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(
+        &tmp,
+        "pyproject.toml",
+        "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n[build-system]\nrequires = []\nbuild-backend = \"setuptools.build_meta\"\n[tool.setuptools]\npackages = [\"shapes\"]\npackage-dir = {\"\" = \"lib\"}\n",
+    );
+    write(&tmp, "lib/shapes/__init__.py", "def stable(): pass\n");
+    write(&tmp, "shapes/__init__.py", "def old(): pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    write(&tmp, "shapes/__init__.py", "def keep(): pass\n");
+    git(&tmp, &["commit", "-qam", "fix: shadow only"]);
+    let plan: Value = serde_json::from_str(&harbor(&[
+        "plan",
+        "--repo",
+        tmp.to_str().unwrap(),
+        "--json",
+    ]))
+    .unwrap();
+    let shapes = entry(&plan, "pypi:shapes");
+    assert_eq!(
+        (shapes["api_checked"].as_bool(), shapes["level"].as_str()),
+        (Some(true), Some("patch")),
+        "{shapes}"
+    );
+    std::fs::remove_dir_all(tmp).unwrap();
 }
 
 #[test]
@@ -583,15 +748,14 @@ fn checks_maturin_python_sources() {
     let repo = tmp.to_str().unwrap();
 
     let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
-    for id in ["pypi:shapes-ext", "pypi:gadget-kit"] {
-        let p = entry(&plan, id);
-        assert_eq!(p["api_checked"], true, "{p}");
-        assert_eq!(
-            (p["level"].as_str(), p["next"].as_str()),
-            (Some("major"), Some("2.0.0")),
-            "{p}"
-        );
-    }
+    let p = entry(&plan, "pypi:shapes-ext");
+    assert_eq!(p["api_checked"], true, "{p}");
+    assert_eq!(
+        (p["level"].as_str(), p["next"].as_str()),
+        (Some("major"), Some("2.0.0")),
+        "{p}"
+    );
+    assert_eq!(entry(&plan, "pypi:gadget-kit")["api_checked"], false);
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
@@ -614,6 +778,7 @@ fn refuses_pure_rust_maturin_projects() {
 
     let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
     assert!(err.contains("pypi:widget-ext"), "{err}");
+    assert_unchecked(repo, &["pypi:widget-ext"]);
     let plan: Value = serde_json::from_str(&harbor(&[
         "plan",
         "--repo",
@@ -647,6 +812,7 @@ fn refuses_setuptools_package_discovery() {
 
     let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
     assert!(err.contains("pypi:shapes"), "{err}");
+    assert_unchecked(repo, &["pypi:shapes"]);
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
@@ -706,6 +872,7 @@ fn refuses_poetry_glob_packages() {
 
     let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
     assert!(err.contains("pypi:acme"), "{err}");
+    assert_unchecked(repo, &["pypi:acme"]);
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
@@ -788,6 +955,7 @@ fn refuses_remapped_python_layouts() {
     assert!(err.contains("pypi:shapes"), "{err}");
     assert!(err.contains("pypi:gadget"), "{err}");
     assert!(err.contains("pypi:acme"), "{err}");
+    assert_unchecked(repo, &["pypi:shapes", "pypi:gadget", "pypi:acme"]);
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
@@ -1074,6 +1242,7 @@ fn refuses_unlocatable_python_apis() {
     let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
     assert!(err.contains("pypi:widget"), "{err}");
     assert!(err.contains("pypi:gadget"), "{err}");
+    assert_unchecked(repo, &["pypi:widget", "pypi:gadget"]);
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 

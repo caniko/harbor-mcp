@@ -65,19 +65,23 @@ own.
 
 ## Python API targets
 
-`griffe check` compares what the project declares: an explicit `setuptools`
-`packages` list of dotted names (with `package-dir = {"" = ...}` or at the
-project root), `setuptools` `py-modules`, Poetry `packages` entries that apply
-to wheels (or Poetry's default canonical project name at the root or under
-`src/`), Hatch wheel `packages`, and the Python package beside a mixed maturin
-project's extension under `python-source`. When nothing is declared, a flat or
-`src/` package named after the distribution is the one assumed surface.
+`griffe check` supports only these backend layouts:
 
-Discovery that harbor-mcp does not emulate — `setuptools` `packages.find`, a
-per-prefix `package-dir`, glob or `to`-remapped Poetry includes, Hatch
-`sources`/`only-include`, and compiled-only maturin extensions — leaves
-`api_unknown`: planning refuses without `--allow-unchecked-publishable` rather
-than guess a layout or fall back to the name heuristic.
+- `setuptools.build_meta`: explicit `packages` including every on-disk
+  subpackage, optionally with `package-dir = {"" = ...}`, and `py-modules`.
+  With no declaration or setup sidecar, a uniquely matching flat or `src/`
+  package named after the distribution is assumed.
+- `poetry.core.masonry.api`: explicit wheel `packages` without globs or `to`,
+  or the default canonical name when exactly one candidate exists.
+- `hatchling.build`: explicit wheel `packages`, without build-level `packages`,
+  or build- or wheel-level `force-include`, `sources` or `only-include`.
+- `maturin`: explicit `python-source` and `module-name`, without
+  `python-packages`.
+
+Other layouts and backends, including Flit, are `api_unknown`; declarations
+never fall back to the name heuristic. An unknown layout at either revision
+is not checked. Planning with API checks disabled refuses publishable packages
+unless `--allow-unchecked-publishable` is supplied.
 
 ## What it owns and what it delegates
 
