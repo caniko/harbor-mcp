@@ -3,7 +3,7 @@
 
 use crate::classify::{self, Baseline, Level};
 use crate::inventory::{self, Config, Ecosystem, Finding, Location, Repo, anchor_value, show};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -38,6 +38,12 @@ pub struct Entry {
     pub manifest: String,
     pub ecosystem: Ecosystem,
     pub publish: bool,
+    /// An API checker compared the package against its baseline.
+    #[serde(default)]
+    pub api_checked: bool,
+    /// Why no API check compared this package, when one could have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_unchecked: Option<String>,
     pub current: String,
     pub next: String,
     pub action: Action,
@@ -82,6 +88,10 @@ pub struct Options {
     /// Read commits and run API checks; false gives the cheap inventory.
     pub classify: bool,
     pub api_checks: bool,
+    /// Revision to plan from instead of each package's last release.
+    pub base: Option<String>,
+    /// Plan publishable units even though no API check compares them.
+    pub allow_unchecked_publishable: bool,
 }
 
 /// Next version for a change of `level`, under Cargo's pre-1.0 rules:
@@ -198,23 +208,75 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
             sources_per_repo.entry(p.repo).or_default().insert(source);
         }
     }
+    // An explicit base moves the comparison point of released packages only:
+    // release status stays what tags and version history say, so unreleased
+    // dependencies still ship inside their consumers.
+    let explicit = match &opts.base {
+        Some(base) => Some(
+            ws.repos
+                .iter()
+                .map(|repo| classify::resolve_base(&repo.path, base))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        None => None,
+    };
     let baselines: Vec<Baseline> = pkgs
         .iter()
         .map(|p| {
-            classify::baseline(
+            let detected = classify::baseline(
                 &ws.repos[p.repo].path,
                 p,
                 sources_per_repo.get(&p.repo).map(BTreeSet::len) == Some(1),
-            )
+            );
+            match (&explicit, detected) {
+                (Some(_), Baseline::Unreleased) => Baseline::Unreleased,
+                (Some(revs), _) => Baseline::Explicit {
+                    rev: revs[p.repo].clone(),
+                },
+                (None, detected) => detected,
+            }
         })
         .collect();
     let mut unit_released = vec![false; n];
     for i in 0..n {
         unit_released[unit[i]] |= baselines[i] != Baseline::Unreleased;
     }
+    // Whether the package had an API surface at its baseline; the check then
+    // compares the union of that surface and the one at HEAD.
+    let baseline_api: Vec<bool> = pkgs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            baselines[i].rev().is_some_and(|rev| {
+                !inventory::api_targets_at(&ws.repos[p.repo].path, rev, p).is_empty()
+            })
+        })
+        .collect();
+
+    // Commits alone cannot show a removed public item: a publishable unit
+    // whose API would not be compared must not get a confident plan. A package
+    // counts as having an API when it has one now or had one at its baseline.
+    if opts.classify && !opts.api_checks && !opts.allow_unchecked_publishable {
+        let mut unchecked = BTreeSet::new();
+        for (i, p) in pkgs.iter().enumerate() {
+            let exempt =
+                !p.publish || ws.config.package(&p.id).and_then(|c| c.api_check) == Some(false);
+            let api = !p.api_targets.is_empty() || p.api_unknown || baseline_api[i];
+            if api && !exempt {
+                unchecked.insert(p.id.as_str());
+            }
+        }
+        if !unchecked.is_empty() {
+            bail!(
+                "API checks are off, so commits alone would plan publishable units {}; a removed public item can understate the bump. Run with API checks or pass --allow-unchecked-publishable (MCP: allowUncheckedPublishable)",
+                unchecked.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
 
     // Intrinsic levels: commits on the package's scope, plus API checks.
     let mut level = vec![Level::None; n];
+    let mut api_checked = vec![false; n];
     let mut reasons: Vec<Vec<String>> = vec![Vec::new(); n];
     for (i, p) in pkgs.iter().enumerate() {
         let Some(base) = baselines[i].rev().filter(|_| opts.classify) else {
@@ -265,7 +327,10 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
         }
         let api_wanted =
             opts.api_checks && p.publish && config.and_then(|c| c.api_check) != Some(false);
-        if api_wanted && p.api_target.is_some() && signal.level > Level::None {
+        if api_wanted
+            && (!p.api_targets.is_empty() || baseline_api[i])
+            && signal.level > Level::None
+        {
             // The checkers read the working tree; the plan describes HEAD.
             let api = if repo.dirty {
                 Err("the working tree has uncommitted changes".to_owned())
@@ -274,6 +339,7 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
             };
             match api {
                 Ok(api) => {
+                    api_checked[i] = true;
                     level[i] = level[i].max(api.level);
                     reasons[i].push(format!("{}: {}", api.source, api.detail));
                 }
@@ -451,12 +517,27 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
                     }
                 })
                 .collect();
+            let api_unchecked = (opts.classify && p.publish && !api_checked[i]).then(|| {
+                if ws.config.package(&p.id).and_then(|c| c.api_check) == Some(false) {
+                    "api_check = false".to_owned()
+                } else if !opts.api_checks {
+                    "API checks off".to_owned()
+                } else if p.api_unknown {
+                    "layout not recognised".to_owned()
+                } else if p.api_targets.is_empty() {
+                    "no API target".to_owned()
+                } else {
+                    "check skipped".to_owned()
+                }
+            });
             entries.push(Entry {
                 id: p.id.clone(),
                 repo: p.repo,
                 manifest: p.manifest.clone(),
                 ecosystem: p.ecosystem,
                 publish: p.publish,
+                api_checked: api_checked[i],
+                api_unchecked,
                 current: p.version.clone(),
                 next: next.clone(),
                 action,
@@ -591,6 +672,9 @@ pub fn render(plan: &Plan) -> String {
         );
         for r in &e.reasons {
             out += &format!("    {r}\n");
+        }
+        if let Some(why) = &e.api_unchecked {
+            out += &format!("    api not checked ({why})\n");
         }
         for a in &e.anchors {
             out += &format!(

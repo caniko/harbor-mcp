@@ -3,7 +3,7 @@
 //! Commits are read as Conventional Commits. API comparison is delegated:
 //! cargo-semver-checks for Cargo libraries, griffe for Python packages.
 
-use crate::inventory::{Ecosystem, Location, Package, git, version_at};
+use crate::inventory::{Ecosystem, Location, Package, api_targets_at, git, version_at};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
@@ -29,6 +29,9 @@ pub enum Baseline {
     Introduced { rev: String, version: String },
     /// The version was never changed and no tag names it: never released.
     Unreleased,
+    /// Planned from an explicit revision instead of a detected release; set
+    /// only for packages whose own history says they were released.
+    Explicit { rev: String },
 }
 
 /// Versions a new package starts at.
@@ -39,7 +42,8 @@ impl Baseline {
         match self {
             Baseline::Tag { rev, .. }
             | Baseline::VersionChange { rev, .. }
-            | Baseline::Introduced { rev, .. } => Some(rev),
+            | Baseline::Introduced { rev, .. }
+            | Baseline::Explicit { rev } => Some(rev),
             Baseline::Unreleased => None,
         }
     }
@@ -75,6 +79,29 @@ pub fn baseline(root: &Path, package: &Package, single: bool) -> Baseline {
         }
     }
     version_change(root, source)
+}
+
+/// Commit an explicit `--base` revision names, or an error saying it does not
+/// resolve or does not precede `HEAD` in `root`.
+pub fn resolve_base(root: &Path, base: &str) -> anyhow::Result<String> {
+    let rev = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .map_err(|_| anyhow::anyhow!("base {base} does not resolve in {}", root.display()))?;
+    let rev = rev.trim().to_owned();
+    git(root, &["merge-base", "--is-ancestor", &rev, "HEAD"]).map_err(|_| {
+        anyhow::anyhow!(
+            "base {base} is not an ancestor of HEAD in {}",
+            root.display()
+        )
+    })?;
+    Ok(rev)
 }
 
 fn version_change(root: &Path, source: &Location) -> Baseline {
@@ -274,11 +301,30 @@ pub fn changelog(text: &str) -> Option<Signal> {
     })
 }
 
-/// Delegate an API comparison against `base`. `Err` explains why none ran.
+/// Delegate an API comparison against `base`, comparing the union of the
+/// surfaces the package had then and has now: a removed surface is breaking,
+/// a new one cannot be. `Err` explains why no comparison ran.
 pub fn api(root: &Path, package: &Package, base: &str) -> Result<Signal, String> {
-    let target = package.api_target.as_deref().ok_or("no API target")?;
+    let baseline = api_targets_at(root, base, package);
+    if package.api_targets.is_empty() && baseline.is_empty() {
+        return Err("no API target".into());
+    }
     match package.ecosystem {
         Ecosystem::Cargo => {
+            if package.api_targets.is_empty() {
+                return Ok(Signal {
+                    level: Level::Major,
+                    source: "cargo-semver-checks".into(),
+                    detail: "lib: removed".into(),
+                });
+            }
+            if baseline.is_empty() {
+                return Ok(Signal {
+                    level: Level::None,
+                    source: "cargo-semver-checks".into(),
+                    detail: "lib: new, nothing to compare".into(),
+                });
+            }
             let manifest = root.join(&package.manifest);
             let out = Command::new("cargo")
                 .current_dir(root)
@@ -329,55 +375,108 @@ pub fn api(root: &Path, package: &Package, base: &str) -> Result<Signal, String>
             })
         }
         Ecosystem::Python => {
-            let import = package.import_name.as_deref().ok_or("no import name")?;
-            let out = Command::new("griffe")
-                .current_dir(root)
-                .args([
-                    "check",
-                    import,
-                    "--against",
-                    base,
-                    "--search",
-                    target,
-                    "--format",
-                    "oneline",
-                    "--no-color",
-                ])
-                .output()
-                .map_err(|e| format!("griffe unavailable: {e}"))?;
-            let err = String::from_utf8_lossy(&out.stderr).into_owned();
-            // griffe exits 1 and prints one `path:line: object: reason` line
-            // per breakage on stderr; other exits or lines are failures.
-            let breaks: Vec<&str> = err
-                .lines()
-                .filter(|l| {
-                    l.split_once(": ")
-                        .and_then(|(at, _)| at.rsplit_once(':'))
-                        .is_some_and(|(_, n)| n.parse::<u32>().is_ok())
-                })
-                .collect();
-            match out.status.code() {
-                Some(0) => Ok(Signal {
+            // Every module present on both sides is checked; one that only
+            // existed at the baseline was removed, and one that is new cannot
+            // break its own baseline. The most severe result wins.
+            let mut checked = Vec::new();
+            for target in &package.api_targets {
+                let import = target.import.as_deref().ok_or("no import name")?;
+                if baseline.iter().any(|b| b.import.as_deref() == Some(import)) {
+                    checked.push((import, griffe(root, base, import, &target.search)?));
+                }
+            }
+            for target in &baseline {
+                let import = target.import.as_deref().ok_or("no import name")?;
+                if !package
+                    .api_targets
+                    .iter()
+                    .any(|h| h.import.as_deref() == Some(import))
+                {
+                    checked.push((
+                        import,
+                        Signal {
+                            level: Level::Major,
+                            source: "griffe".into(),
+                            detail: "removed".into(),
+                        },
+                    ));
+                }
+            }
+            let Some(level) = checked.iter().map(|(_, s)| s.level).max() else {
+                return Ok(Signal {
                     level: Level::None,
                     source: "griffe".into(),
-                    detail: "no breaking API changes".into(),
-                }),
-                Some(1) if !breaks.is_empty() => Ok(Signal {
-                    level: Level::Major,
-                    source: "griffe".into(),
-                    detail: breaks
-                        .iter()
-                        .take(3)
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                }),
-                _ => Err(format!(
-                    "griffe check failed: {}",
-                    err.trim().lines().last().unwrap_or_default()
-                )),
-            }
+                    detail: "new modules only, nothing to compare".into(),
+                });
+            };
+            let detail = if level == Level::None {
+                "no breaking API changes".to_owned()
+            } else {
+                checked
+                    .iter()
+                    .filter(|(_, s)| s.level == level)
+                    .map(|(import, s)| format!("{import}: {}", s.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            Ok(Signal {
+                level,
+                source: "griffe".into(),
+                detail,
+            })
         }
+    }
+}
+
+/// Level of one griffe comparison. `Err` covers an unusable checker or an
+/// exit that is neither "no breakage" nor "breakage lines".
+fn griffe(root: &Path, base: &str, import: &str, search: &str) -> Result<Signal, String> {
+    let out = Command::new("griffe")
+        .current_dir(root)
+        .args([
+            "check",
+            import,
+            "--against",
+            base,
+            "--search",
+            search,
+            "--format",
+            "oneline",
+            "--no-color",
+        ])
+        .output()
+        .map_err(|e| format!("griffe unavailable: {e}"))?;
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    // griffe exits 1 and prints one `path:line: object: reason` line
+    // per breakage on stderr; other exits or lines are failures.
+    let breaks: Vec<&str> = err
+        .lines()
+        .filter(|l| {
+            l.split_once(": ")
+                .and_then(|(at, _)| at.rsplit_once(':'))
+                .is_some_and(|(_, n)| n.parse::<u32>().is_ok())
+        })
+        .collect();
+    match out.status.code() {
+        Some(0) => Ok(Signal {
+            level: Level::None,
+            source: "griffe".into(),
+            detail: "no breaking API changes".into(),
+        }),
+        Some(1) if !breaks.is_empty() => Ok(Signal {
+            level: Level::Major,
+            source: "griffe".into(),
+            detail: breaks
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("; "),
+        }),
+        _ => Err(format!(
+            "griffe check failed: {}",
+            err.trim().lines().last().unwrap_or_default()
+        )),
     }
 }
 
