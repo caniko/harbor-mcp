@@ -752,7 +752,10 @@ fn python_targets(dir: &str, doc: &toml::Table, files: &[String]) -> Vec<(String
                     if files
                         .iter()
                         .filter_map(|f| f.strip_prefix(&prefix))
-                        .filter_map(|p| p.strip_suffix("/__init__.py"))
+                        // Any directory holding Python sources is a subpackage
+                        // griffe recurses into, with or without `__init__.py`.
+                        .filter(|p| p.ends_with(".py"))
+                        .filter_map(|p| p.rsplit_once('/').map(|(sub, _)| sub))
                         .any(|sub| {
                             let name = format!("{import}.{}", sub.replace('/', "."));
                             !list.iter().any(|v| v.as_str() == Some(&name))

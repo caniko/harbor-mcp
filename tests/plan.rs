@@ -111,6 +111,12 @@ fn unknown_python_layouts_are_not_checked() {
             "[tool.setuptools]\npackages = [\"shapes\"]\n",
             "shapes/extras/__init__.py",
         ),
+        (
+            "namespace-subpackage",
+            "setuptools.build_meta",
+            "[tool.setuptools]\npackages = [\"shapes\"]\n",
+            "shapes/extras/mod.py",
+        ),
     ] {
         let dir = tmp.join(case);
         std::fs::create_dir_all(&dir).unwrap();
