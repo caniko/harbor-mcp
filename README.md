@@ -12,6 +12,7 @@ projects, and runs as an MCP server for agents or as a CLI.
 
 ```sh
 harbor-mcp plan --repo ../core --repo ../app        # read-only plan
+harbor-mcp plan --repo . --base v0.11.0             # plan from a release commit
 harbor-mcp plan --repo . --json > plan.json
 harbor-mcp apply plan.json                           # write the version edits
 harbor-mcp inventory --repo .                        # versions, baselines, drift
@@ -26,7 +27,9 @@ For every package it finds:
    (`name/vX`, `name-vX`, `name@X`, or `vX`/`X` for a repository's root
    or only package). Without one, it is the newest commit that changed the
    version. A package whose version never changed is unreleased, and its
-   first release keeps the declared version.
+   first release keeps the declared version. `--base REV` (MCP `base`) plans
+   from an explicit revision — the previous release commit or tag — instead,
+   which keeps a plan meaningful once the bump commit exists.
 2. **Change level** since the baseline is the strongest signal from:
    - Conventional Commits on the package's paths: `!` or `BREAKING CHANGE`
      is major, `feat` minor, `docs`/`test`/`ci`/`style` nothing, and any
@@ -35,6 +38,11 @@ For every package it finds:
    - API comparison against the baseline: `cargo semver-checks` for Cargo
      libraries, `griffe check` for Python packages. Both run only for
      packages that publish and changed.
+   Skipping API checks (`--no-api-checks`, MCP `apiChecks: false`) refuses to
+   plan publishable units with a public API, since commit markers alone can
+   miss a removed public item; `--allow-unchecked-publishable` (MCP
+   `allowUncheckedPublishable: true`) plans them anyway and marks their
+   entries `api_checked: false`.
 3. **Release units.** Packages that share a version source (Cargo
    `version.workspace = true`) or `follow` another package move together at
    the strongest member's level.

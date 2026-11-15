@@ -3,7 +3,7 @@
 
 use crate::classify::{self, Baseline, Level};
 use crate::inventory::{self, Config, Ecosystem, Finding, Location, Repo, anchor_value, show};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -38,6 +38,9 @@ pub struct Entry {
     pub manifest: String,
     pub ecosystem: Ecosystem,
     pub publish: bool,
+    /// An API checker compared the package against its baseline.
+    #[serde(default)]
+    pub api_checked: bool,
     pub current: String,
     pub next: String,
     pub action: Action,
@@ -82,6 +85,10 @@ pub struct Options {
     /// Read commits and run API checks; false gives the cheap inventory.
     pub classify: bool,
     pub api_checks: bool,
+    /// Revision to plan from instead of each package's last release.
+    pub base: Option<String>,
+    /// Plan publishable units even though no API check compares them.
+    pub allow_unchecked_publishable: bool,
 }
 
 /// Next version for a change of `level`, under Cargo's pre-1.0 rules:
@@ -198,23 +205,50 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
             sources_per_repo.entry(p.repo).or_default().insert(source);
         }
     }
-    let baselines: Vec<Baseline> = pkgs
-        .iter()
-        .map(|p| {
-            classify::baseline(
-                &ws.repos[p.repo].path,
-                p,
-                sources_per_repo.get(&p.repo).map(BTreeSet::len) == Some(1),
-            )
-        })
-        .collect();
+    let baselines: Vec<Baseline> = match &opts.base {
+        Some(base) => pkgs
+            .iter()
+            .map(|p| {
+                classify::resolve_base(&ws.repos[p.repo].path, base)
+                    .map(|rev| Baseline::Explicit { rev })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => pkgs
+            .iter()
+            .map(|p| {
+                classify::baseline(
+                    &ws.repos[p.repo].path,
+                    p,
+                    sources_per_repo.get(&p.repo).map(BTreeSet::len) == Some(1),
+                )
+            })
+            .collect(),
+    };
     let mut unit_released = vec![false; n];
     for i in 0..n {
         unit_released[unit[i]] |= baselines[i] != Baseline::Unreleased;
     }
 
+    // Commits alone cannot show a removed public item: a publishable unit
+    // whose API would not be compared must not get a confident plan.
+    if opts.classify && !opts.api_checks && !opts.allow_unchecked_publishable {
+        let unchecked: BTreeSet<&str> = pkgs
+            .iter()
+            .filter(|p| p.publish && p.api_target.is_some())
+            .filter(|p| ws.config.package(&p.id).and_then(|c| c.api_check) != Some(false))
+            .map(|p| p.id.as_str())
+            .collect();
+        if !unchecked.is_empty() {
+            bail!(
+                "API checks are off, so commits alone would plan publishable units {}; a removed public item can understate the bump. Run with API checks or pass --allow-unchecked-publishable (MCP: allowUncheckedPublishable)",
+                unchecked.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
     // Intrinsic levels: commits on the package's scope, plus API checks.
     let mut level = vec![Level::None; n];
+    let mut api_checked = vec![false; n];
     let mut reasons: Vec<Vec<String>> = vec![Vec::new(); n];
     for (i, p) in pkgs.iter().enumerate() {
         let Some(base) = baselines[i].rev().filter(|_| opts.classify) else {
@@ -274,6 +308,7 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
             };
             match api {
                 Ok(api) => {
+                    api_checked[i] = true;
                     level[i] = level[i].max(api.level);
                     reasons[i].push(format!("{}: {}", api.source, api.detail));
                 }
@@ -457,6 +492,7 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
                 manifest: p.manifest.clone(),
                 ecosystem: p.ecosystem,
                 publish: p.publish,
+                api_checked: api_checked[i],
                 current: p.version.clone(),
                 next: next.clone(),
                 action,

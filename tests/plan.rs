@@ -45,6 +45,15 @@ fn harbor(args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+fn harbor_fail(args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_harbor-mcp"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{args:?} should fail");
+    String::from_utf8(out.stderr).unwrap()
+}
+
 fn entry<'a>(plan: &'a Value, id: &str) -> &'a Value {
     plan["packages"]
         .as_array()
@@ -165,6 +174,7 @@ fn plans_propagates_and_applies() {
         &consumers[1],
         "--json",
         "--no-api-checks",
+        "--allow-unchecked-publishable",
     ]))
     .unwrap();
     let core = entry(&plan, "cargo:core");
@@ -257,5 +267,116 @@ fn plans_propagates_and_applies() {
         .output()
         .unwrap();
     assert!(!again.status.success());
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn refuses_unchecked_publishable_units() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(
+        &tmp,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        &tmp,
+        "crates/api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+    );
+    write(&tmp, "crates/api/src/lib.rs", "pub fn a() {}\n");
+    write(
+        &tmp,
+        "crates/cli/Cargo.toml",
+        "[package]\nname = \"cli\"\nversion = \"0.1.0\"\npublish = false\n",
+    );
+    write(&tmp, "crates/cli/src/main.rs", "fn main() {}\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    let repo = tmp.to_str().unwrap();
+
+    let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
+    assert!(err.contains("cargo:api"), "{err}");
+    assert!(!err.contains("cargo:cli"), "{err}");
+    assert!(err.contains("--allow-unchecked-publishable"), "{err}");
+
+    let plan: Value = serde_json::from_str(&harbor(&[
+        "plan",
+        "--repo",
+        repo,
+        "--json",
+        "--no-api-checks",
+        "--allow-unchecked-publishable",
+    ]))
+    .unwrap();
+    assert_eq!(entry(&plan, "cargo:api")["api_checked"], false);
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn plans_from_an_explicit_base() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-base-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    let manifest = |version: &str| format!("[package]\nname = \"lib\"\nversion = \"{version}\"\n");
+    write(&tmp, "Cargo.toml", &manifest("0.1.0"));
+    write(&tmp, "src/lib.rs", "pub fn a() {}\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v0.1.0"]);
+    // The bump commit itself: at this head no revision is left to plan from.
+    write(&tmp, "Cargo.toml", &manifest("0.2.0"));
+    write(&tmp, "src/lib.rs", "pub fn b() {}\n");
+    git(&tmp, &["commit", "-qam", "feat!: replace a with b"]);
+    let repo = tmp.to_str().unwrap();
+    let plan: Value = serde_json::from_str(&harbor(&[
+        "plan",
+        "--repo",
+        repo,
+        "--json",
+        "--no-api-checks",
+        "--allow-unchecked-publishable",
+    ]))
+    .unwrap();
+    let at_head = entry(&plan, "cargo:lib");
+    assert_eq!(at_head["action"], "unchanged");
+    assert!(
+        at_head["reasons"]
+            .to_string()
+            .contains("no commits since the release")
+    );
+
+    let plan: Value = serde_json::from_str(&harbor(&[
+        "plan",
+        "--repo",
+        repo,
+        "--json",
+        "--base",
+        "v0.1.0",
+        "--no-api-checks",
+        "--allow-unchecked-publishable",
+    ]))
+    .unwrap();
+    let lib = entry(&plan, "cargo:lib");
+    assert_eq!(lib["baseline"]["kind"], "explicit");
+    assert_eq!(
+        (lib["level"].as_str(), lib["next"].as_str()),
+        (Some("major"), Some("0.3.0"))
+    );
+
+    let err = harbor_fail(&[
+        "plan",
+        "--repo",
+        repo,
+        "--json",
+        "--base",
+        "nope",
+        "--no-api-checks",
+        "--allow-unchecked-publishable",
+    ]);
+    assert!(err.contains("base nope does not resolve"), "{err}");
     std::fs::remove_dir_all(&tmp).unwrap();
 }

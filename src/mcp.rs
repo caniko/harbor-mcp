@@ -27,6 +27,11 @@ struct PlanArgs {
     scope: Scope,
     /// Run cargo-semver-checks and griffe against each release baseline (default true).
     api_checks: Option<bool>,
+    /// Plan publishable units even though no API check compares them.
+    allow_unchecked_publishable: Option<bool>,
+    /// Revision to plan from (the previous release) instead of the detected
+    /// last release.
+    base: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -64,13 +69,15 @@ impl HarborMcp {
             Options {
                 classify: false,
                 api_checks: false,
+                base: None,
+                allow_unchecked_publishable: false,
             },
         )
         .await
     }
 
     #[tool(
-        description = "Semver bump plan: classifies each package's changes since its last release (Conventional Commits, cargo-semver-checks, griffe), applies pre-1.0 rules, propagates bumps to dependents, orders packages dependencies-first, and lists requirement edits and the steps other tools own. Read-only."
+        description = "Semver bump plan: classifies each package's changes since its last release (Conventional Commits, cargo-semver-checks, griffe), applies pre-1.0 rules, propagates bumps to dependents, orders packages dependencies-first, and lists requirement edits and the steps other tools own. Optional `base` plans from an explicit revision instead. Read-only."
     )]
     async fn plan(&self, Parameters(a): Parameters<PlanArgs>) -> Result<String, String> {
         run(
@@ -78,6 +85,8 @@ impl HarborMcp {
             Options {
                 classify: true,
                 api_checks: a.api_checks.unwrap_or(true),
+                base: a.base,
+                allow_unchecked_publishable: a.allow_unchecked_publishable.unwrap_or(false),
             },
         )
         .await

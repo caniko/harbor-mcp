@@ -29,6 +29,8 @@ pub enum Baseline {
     Introduced { rev: String, version: String },
     /// The version was never changed and no tag names it: never released.
     Unreleased,
+    /// Planned from an explicit revision instead of a detected release.
+    Explicit { rev: String },
 }
 
 /// Versions a new package starts at.
@@ -39,7 +41,8 @@ impl Baseline {
         match self {
             Baseline::Tag { rev, .. }
             | Baseline::VersionChange { rev, .. }
-            | Baseline::Introduced { rev, .. } => Some(rev),
+            | Baseline::Introduced { rev, .. }
+            | Baseline::Explicit { rev } => Some(rev),
             Baseline::Unreleased => None,
         }
     }
@@ -75,6 +78,22 @@ pub fn baseline(root: &Path, package: &Package, single: bool) -> Baseline {
         }
     }
     version_change(root, source)
+}
+
+/// Commit an explicit `--base` revision names, or an error saying it does not
+/// resolve in `root`.
+pub fn resolve_base(root: &Path, base: &str) -> anyhow::Result<String> {
+    let rev = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .map_err(|_| anyhow::anyhow!("base {base} does not resolve in {}", root.display()))?;
+    Ok(rev.trim().to_owned())
 }
 
 fn version_change(root: &Path, source: &Location) -> Baseline {

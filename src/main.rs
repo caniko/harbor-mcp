@@ -39,6 +39,13 @@ enum Command {
         /// Skip cargo-semver-checks and griffe.
         #[arg(long)]
         no_api_checks: bool,
+        /// Plan publishable units even though no API check compares them.
+        #[arg(long)]
+        allow_unchecked_publishable: bool,
+        /// Revision to plan from (the previous release) instead of the
+        /// detected last release.
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
     },
     /// Write the version edits of a plan produced by `plan --json`.
     Apply {
@@ -75,16 +82,22 @@ async fn main() -> Result<()> {
             plan::Options {
                 classify: false,
                 api_checks: false,
+                base: None,
+                allow_unchecked_publishable: false,
             },
         ),
         Command::Plan {
             scope,
             no_api_checks,
+            allow_unchecked_publishable,
+            base,
         } => run(
             &scope,
             plan::Options {
                 classify: true,
                 api_checks: !no_api_checks,
+                base,
+                allow_unchecked_publishable,
             },
         ),
         Command::Apply { plan, dry_run } => {
