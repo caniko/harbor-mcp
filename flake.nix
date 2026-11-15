@@ -50,8 +50,8 @@
       unwrapped = craneLib.buildPackage (common
         // {
           inherit cargoArtifacts;
-          # The end-to-end test builds a fixture Git repository.
-          nativeCheckInputs = [pkgs.git];
+          # The end-to-end tests build fixture Git repositories and run griffe.
+          nativeCheckInputs = [pkgs.git pkgs.python3Packages.griffe];
         });
       # The delegated checkers ship with the binary; cargo comes from the
       # repository being planned, since semver-checks builds its rustdoc.
