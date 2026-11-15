@@ -144,6 +144,9 @@ pub struct Package {
     /// `<search path>` for an importable Python package.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_target: Option<String>,
+    /// A publishable project whose importable code could not be located: no
+    /// API check can run, so planning it unchecked must not be confident.
+    pub api_unknown: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import_name: Option<String>,
     pub deps: Vec<Dep>,
@@ -543,6 +546,7 @@ fn discover_cargo(
             version_source,
             publish,
             api_target: lib.then(|| "lib".into()),
+            api_unknown: false,
             import_name: None,
             deps,
         });
@@ -581,6 +585,54 @@ fn normalize(path: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// Importable code a Python project declares under `dir`: a package
+/// directory, or single modules listed in `py-modules`. `exists` answers for
+/// one repository-relative path at whatever revision is being inspected.
+fn python_target(
+    dir: &str,
+    doc: &toml::Table,
+    exists: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    let project = doc.get("project")?.as_table()?;
+    let name = project.get("name")?.as_str()?;
+    let import = name.replace(['-', '.'], "_").to_ascii_lowercase();
+    let roots = [join(dir, "src"), dir.to_owned()];
+    let package = join(&import, "__init__.py");
+    if let Some(root) = roots.iter().find(|r| exists(&join(r, &package))) {
+        return Some((root.clone(), import));
+    }
+    let modules = doc
+        .get("tool")
+        .and_then(|t| t.get("setuptools"))
+        .map(|t| strs(t.get("py-modules")))
+        .unwrap_or_default();
+    for module in modules {
+        let file = format!("{module}.py");
+        if let Some(root) = roots.iter().find(|r| exists(&join(r, &file))) {
+            return Some((root.clone(), module));
+        }
+    }
+    None
+}
+
+/// Whether an API checker could compare `package` at `rev`: the Cargo library
+/// or Python importable code it has there.
+pub fn api_target_at(root: &Path, rev: &str, package: &Package) -> bool {
+    match package.ecosystem {
+        Ecosystem::Cargo => {
+            let lib = show(root, rev, &package.manifest)
+                .and_then(|text| text.parse::<toml::Table>().ok())
+                .is_some_and(|doc| doc.contains_key("lib"));
+            lib || show(root, rev, &join(&package.dir, "src/lib.rs")).is_some()
+        }
+        Ecosystem::Python => show(root, rev, &package.manifest)
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .is_some_and(|doc| {
+                python_target(&package.dir, &doc, |path| show(root, rev, path).is_some()).is_some()
+            }),
+    }
 }
 
 fn discover_python(
@@ -677,12 +729,11 @@ fn discover_python(
                 }
             }
         }
-        let import = name.replace(['-', '.'], "_").to_ascii_lowercase();
-        let search = [join(dir, "src"), dir.to_owned()].into_iter().find(|s| {
-            files
-                .iter()
-                .any(|f| *f == join(&join(s, &import), "__init__.py"))
-        });
+        let api = python_target(dir, &doc, |path| files.iter().any(|f| f == path));
+        let (api_target, import_name) = match api {
+            Some((search, import)) => (Some(search), Some(import)),
+            None => (None, None),
+        };
         out.push(Package {
             id: format!("pypi:{}", normalize_python(name)),
             name: name.to_owned(),
@@ -699,8 +750,9 @@ fn discover_python(
             publish: !strs(project.get("classifiers"))
                 .iter()
                 .any(|c| c.starts_with("Private ::")),
-            api_target: search,
-            import_name: Some(import),
+            api_unknown: api_target.is_none(),
+            api_target,
+            import_name,
             deps,
         });
     }

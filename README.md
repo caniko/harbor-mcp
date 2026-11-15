@@ -28,8 +28,9 @@ For every package it finds:
    or only package). Without one, it is the newest commit that changed the
    version. A package whose version never changed is unreleased, and its
    first release keeps the declared version. `--base REV` (MCP `base`) plans
-   from an explicit revision — the previous release commit or tag — instead,
-   which keeps a plan meaningful once the bump commit exists.
+   from an explicit revision — the previous release commit or tag, which must
+   be an ancestor of `HEAD` — instead, which keeps a plan meaningful once the
+   bump commit exists.
 2. **Change level** since the baseline is the strongest signal from:
    - Conventional Commits on the package's paths: `!` or `BREAKING CHANGE`
      is major, `feat` minor, `docs`/`test`/`ci`/`style` nothing, and any
@@ -40,9 +41,11 @@ For every package it finds:
      packages that publish and changed.
    Skipping API checks (`--no-api-checks`, MCP `apiChecks: false`) refuses to
    plan publishable units with a public API, since commit markers alone can
-   miss a removed public item; `--allow-unchecked-publishable` (MCP
-   `allowUncheckedPublishable: true`) plans them anyway and marks their
-   entries `api_checked: false`.
+   miss a removed public item; a package configured `api_check = false` makes
+   that choice explicitly and is exempt. `--allow-unchecked-publishable` (MCP
+   `allowUncheckedPublishable: true`) plans them anyway, marking entries
+   `api_checked: false` and a `api not checked (<reason>)` line in the text
+   plan.
 3. **Release units.** Packages that share a version source (Cargo
    `version.workspace = true`) or `follow` another package move together at
    the strongest member's level.

@@ -312,6 +312,14 @@ fn refuses_unchecked_publishable_units() {
     ]))
     .unwrap();
     assert_eq!(entry(&plan, "cargo:api")["api_checked"], false);
+    let text = harbor(&[
+        "plan",
+        "--repo",
+        repo,
+        "--no-api-checks",
+        "--allow-unchecked-publishable",
+    ]);
+    assert!(text.contains("api not checked (API checks off)"), "{text}");
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
@@ -378,5 +386,151 @@ fn plans_from_an_explicit_base() {
         "--allow-unchecked-publishable",
     ]);
     assert!(err.contains("base nope does not resolve"), "{err}");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn explicit_base_keeps_release_status() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(
+        &tmp,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        &tmp,
+        "crates/app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\nhelper = { path = \"../helper\" }\n",
+    );
+    write(&tmp, "crates/app/src/main.rs", "fn main() {}\n");
+    write(
+        &tmp,
+        "crates/helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\npublish = false\n",
+    );
+    write(&tmp, "crates/helper/src/lib.rs", "pub fn a() {}\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "app/v1.0.0"]);
+    // An unreleased private dependency: its breaking change ships inside app.
+    write(&tmp, "crates/helper/src/lib.rs", "pub fn b() {}\n");
+    git(&tmp, &["commit", "-qam", "refactor(helper)!: reshape"]);
+    let repo = tmp.to_str().unwrap();
+
+    let planned = |extra: &[&str]| -> Value {
+        let mut args = vec!["plan", "--repo", repo, "--json"];
+        args.extend_from_slice(extra);
+        serde_json::from_str(&harbor(&args)).unwrap()
+    };
+    let auto = planned(&[]);
+    let based = planned(&["--base", "app/v1.0.0"]);
+    for id in ["cargo:app", "cargo:helper"] {
+        let pick = |plan: &Value| {
+            let e = entry(plan, id);
+            (
+                e["action"].clone(),
+                e["next"].clone(),
+                e["bump"].clone(),
+                e["level"].clone(),
+            )
+        };
+        assert_eq!(pick(&auto), pick(&based), "{id}");
+    }
+    assert_eq!(entry(&auto, "cargo:app")["next"], "2.0.0");
+    assert_eq!(entry(&auto, "cargo:helper")["action"], "initial");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn refuses_publishable_units_that_lost_their_api() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-lost-api-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(
+        &tmp,
+        "Cargo.toml",
+        "[package]\nname = \"widget\"\nversion = \"1.0.0\"\n",
+    );
+    write(&tmp, "src/lib.rs", "pub fn a() {}\n");
+    write(&tmp, "src/main.rs", "fn main() {}\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    // The crate is published, and its released API was a library.
+    std::fs::remove_file(tmp.join("src/lib.rs")).unwrap();
+    write(&tmp, "src/main.rs", "fn main() { println!(\"x\"); }\n");
+    git(&tmp, &["commit", "-qam", "fix: bins only"]);
+    let repo = tmp.to_str().unwrap();
+
+    let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
+    assert!(err.contains("cargo:widget"), "{err}");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn refuses_unlocatable_python_apis() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-python-api-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    let project = |name: &str, tool: &str| {
+        format!(
+            "[project]\nname = \"{name}\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools]\n{tool}"
+        )
+    };
+    // A setuptools single-module distribution, and a layout harbor-mcp cannot
+    // place at all.
+    write(
+        &tmp,
+        "modules/pyproject.toml",
+        &project("widget", "py-modules = [\"widget\"]\n"),
+    );
+    write(&tmp, "modules/widget.py", "def run():\n    pass\n");
+    write(
+        &tmp,
+        "packaged/pyproject.toml",
+        &project("gadget", "package-dir = {\"\" = \"lib\"}\n"),
+    );
+    write(&tmp, "packaged/lib/gadget/__init__.py", "");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    let repo = tmp.to_str().unwrap();
+
+    let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
+    assert!(err.contains("pypi:widget"), "{err}");
+    assert!(err.contains("pypi:gadget"), "{err}");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn rejects_a_base_outside_history() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-ancestor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(
+        &tmp,
+        "Cargo.toml",
+        "[package]\nname = \"widget\"\nversion = \"0.1.0\"\n",
+    );
+    write(&tmp, "src/lib.rs", "pub fn a() {}\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    write(&tmp, "src/lib.rs", "pub fn b() {}\n");
+    git(&tmp, &["commit", "-qam", "feat: later"]);
+    git(&tmp, &["tag", "later"]);
+    // Drop the tagged commit: it is no longer an ancestor of HEAD.
+    git(&tmp, &["reset", "--hard", "HEAD~1"]);
+    let repo = tmp.to_str().unwrap();
+
+    let err = harbor_fail(&["plan", "--repo", repo, "--json", "--base", "later"]);
+    assert!(
+        err.contains("base later is not an ancestor of HEAD"),
+        "{err}"
+    );
     std::fs::remove_dir_all(&tmp).unwrap();
 }

@@ -29,7 +29,8 @@ pub enum Baseline {
     Introduced { rev: String, version: String },
     /// The version was never changed and no tag names it: never released.
     Unreleased,
-    /// Planned from an explicit revision instead of a detected release.
+    /// Planned from an explicit revision instead of a detected release; set
+    /// only for packages whose own history says they were released.
     Explicit { rev: String },
 }
 
@@ -81,7 +82,7 @@ pub fn baseline(root: &Path, package: &Package, single: bool) -> Baseline {
 }
 
 /// Commit an explicit `--base` revision names, or an error saying it does not
-/// resolve in `root`.
+/// resolve or does not precede `HEAD` in `root`.
 pub fn resolve_base(root: &Path, base: &str) -> anyhow::Result<String> {
     let rev = git(
         root,
@@ -93,7 +94,14 @@ pub fn resolve_base(root: &Path, base: &str) -> anyhow::Result<String> {
         ],
     )
     .map_err(|_| anyhow::anyhow!("base {base} does not resolve in {}", root.display()))?;
-    Ok(rev.trim().to_owned())
+    let rev = rev.trim().to_owned();
+    git(root, &["merge-base", "--is-ancestor", &rev, "HEAD"]).map_err(|_| {
+        anyhow::anyhow!(
+            "base {base} is not an ancestor of HEAD in {}",
+            root.display()
+        )
+    })?;
+    Ok(rev)
 }
 
 fn version_change(root: &Path, source: &Location) -> Baseline {
