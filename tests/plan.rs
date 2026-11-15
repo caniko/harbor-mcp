@@ -534,3 +534,40 @@ fn rejects_a_base_outside_history() {
     );
     std::fs::remove_dir_all(&tmp).unwrap();
 }
+
+#[test]
+fn checks_every_python_module() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-py-modules-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    write(
+        &tmp,
+        "pyproject.toml",
+        "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools]\npy-modules = [\"alpha\", \"beta\"]\n",
+    );
+    write(&tmp, "alpha.py", "def stable():\n    pass\n");
+    write(
+        &tmp,
+        "beta.py",
+        "def old():\n    pass\n\ndef keep():\n    pass\n",
+    );
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    // Only the second module loses a public name, under a commit that is a
+    // patch by itself.
+    write(&tmp, "beta.py", "def keep():\n    pass\n");
+    git(&tmp, &["commit", "-qam", "fix: drop beta.old"]);
+    let repo = tmp.to_str().unwrap();
+
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    let shapes = entry(&plan, "pypi:shapes");
+    assert_eq!(shapes["api_checked"], true);
+    assert_eq!(
+        (shapes["level"].as_str(), shapes["next"].as_str()),
+        (Some("major"), Some("2.0.0"))
+    );
+    assert!(shapes["reasons"].to_string().contains("beta:"), "{shapes}");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}

@@ -140,16 +140,24 @@ pub struct Package {
     /// Where `version` is written; `None` when the manifest declares none.
     pub version_source: Option<Location>,
     pub publish: bool,
-    /// Present when an API checker can inspect it: `lib` for a Cargo library,
-    /// `<search path>` for an importable Python package.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_target: Option<String>,
+    /// Every surface an API checker can compare: the Cargo library, or each
+    /// Python package and declared module.
+    pub api_targets: Vec<ApiTarget>,
     /// A publishable project whose importable code could not be located: no
     /// API check can run, so planning it unchecked must not be confident.
     pub api_unknown: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub import_name: Option<String>,
     pub deps: Vec<Dep>,
+}
+
+/// Where an API checker finds one surface: a Cargo library, or one Python
+/// import under the directory griffe searches.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiTarget {
+    /// `lib` for Cargo; the search path griffe gets for Python.
+    pub search: String,
+    /// Python module or package name; none for Cargo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,9 +553,14 @@ fn discover_cargo(
             version,
             version_source,
             publish,
-            api_target: lib.then(|| "lib".into()),
+            api_targets: lib
+                .then(|| ApiTarget {
+                    search: "lib".into(),
+                    import: None,
+                })
+                .into_iter()
+                .collect(),
             api_unknown: false,
-            import_name: None,
             deps,
         });
     }
@@ -587,21 +600,27 @@ fn normalize(path: &str) -> String {
     parts.join("/")
 }
 
-/// Importable code a Python project declares under `dir`: a package
-/// directory, or single modules listed in `py-modules`. `exists` answers for
-/// one repository-relative path at whatever revision is being inspected.
-fn python_target(
+/// Importable code a Python project declares under `dir`: its package
+/// directory and every module in `py-modules`, each with the search path it
+/// lives under. `exists` answers for one repository-relative path at whatever
+/// revision is being inspected.
+fn python_targets(
     dir: &str,
     doc: &toml::Table,
     exists: impl Fn(&str) -> bool,
-) -> Option<(String, String)> {
-    let project = doc.get("project")?.as_table()?;
-    let name = project.get("name")?.as_str()?;
+) -> Vec<(String, String)> {
+    let Some(project) = doc.get("project").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+    let Some(name) = project.get("name").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
     let import = name.replace(['-', '.'], "_").to_ascii_lowercase();
     let roots = [join(dir, "src"), dir.to_owned()];
+    let mut targets = Vec::new();
     let package = join(&import, "__init__.py");
     if let Some(root) = roots.iter().find(|r| exists(&join(r, &package))) {
-        return Some((root.clone(), import));
+        targets.push((root.clone(), import));
     }
     let modules = doc
         .get("tool")
@@ -609,12 +628,15 @@ fn python_target(
         .map(|t| strs(t.get("py-modules")))
         .unwrap_or_default();
     for module in modules {
+        if targets.iter().any(|(_, import)| *import == module) {
+            continue;
+        }
         let file = format!("{module}.py");
         if let Some(root) = roots.iter().find(|r| exists(&join(r, &file))) {
-            return Some((root.clone(), module));
+            targets.push((root.clone(), module));
         }
     }
-    None
+    targets
 }
 
 /// Whether an API checker could compare `package` at `rev`: the Cargo library
@@ -630,7 +652,8 @@ pub fn api_target_at(root: &Path, rev: &str, package: &Package) -> bool {
         Ecosystem::Python => show(root, rev, &package.manifest)
             .and_then(|text| text.parse::<toml::Table>().ok())
             .is_some_and(|doc| {
-                python_target(&package.dir, &doc, |path| show(root, rev, path).is_some()).is_some()
+                !python_targets(&package.dir, &doc, |path| show(root, rev, path).is_some())
+                    .is_empty()
             }),
     }
 }
@@ -729,11 +752,15 @@ fn discover_python(
                 }
             }
         }
-        let api = python_target(dir, &doc, |path| files.iter().any(|f| f == path));
-        let (api_target, import_name) = match api {
-            Some((search, import)) => (Some(search), Some(import)),
-            None => (None, None),
-        };
+        let api_targets: Vec<ApiTarget> =
+            python_targets(dir, &doc, |path| files.iter().any(|f| f == path))
+                .into_iter()
+                .map(|(search, import)| ApiTarget {
+                    search,
+                    import: Some(import),
+                })
+                .collect();
+        let api_unknown = api_targets.is_empty();
         out.push(Package {
             id: format!("pypi:{}", normalize_python(name)),
             name: name.to_owned(),
@@ -750,9 +777,8 @@ fn discover_python(
             publish: !strs(project.get("classifiers"))
                 .iter()
                 .any(|c| c.starts_with("Private ::")),
-            api_unknown: api_target.is_none(),
-            api_target,
-            import_name,
+            api_unknown,
+            api_targets,
             deps,
         });
     }

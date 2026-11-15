@@ -251,7 +251,7 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
             if !p.publish || ws.config.package(&p.id).and_then(|c| c.api_check) == Some(false) {
                 continue;
             }
-            let api = p.api_target.is_some()
+            let api = !p.api_targets.is_empty()
                 || p.api_unknown
                 || baselines[i]
                     .rev()
@@ -321,7 +321,7 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
         }
         let api_wanted =
             opts.api_checks && p.publish && config.and_then(|c| c.api_check) != Some(false);
-        if api_wanted && p.api_target.is_some() && signal.level > Level::None {
+        if api_wanted && !p.api_targets.is_empty() && signal.level > Level::None {
             // The checkers read the working tree; the plan describes HEAD.
             let api = if repo.dirty {
                 Err("the working tree has uncommitted changes".to_owned())
@@ -515,7 +515,7 @@ pub fn plan(paths: &[PathBuf], extra: &Config, opts: &Options) -> Result<Plan> {
                     "API checks off".to_owned()
                 } else if p.api_unknown {
                     "layout not recognised".to_owned()
-                } else if p.api_target.is_none() {
+                } else if p.api_targets.is_empty() {
                     "no API target".to_owned()
                 } else {
                     "check skipped".to_owned()
