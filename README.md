@@ -63,6 +63,26 @@ For every package it finds:
 The plan lists packages dependencies-first and names the steps other tools
 own.
 
+## Python API targets
+
+`griffe check` supports only these backend layouts:
+
+- `setuptools.build_meta`: explicit `packages` including every on-disk
+  subpackage, optionally with `package-dir = {"" = ...}`, and `py-modules`.
+  With no declaration or setup sidecar, a uniquely matching flat or `src/`
+  package named after the distribution is assumed.
+- `poetry.core.masonry.api`: explicit wheel `packages` without globs or `to`,
+  or the default canonical name when exactly one candidate exists.
+- `hatchling.build`: explicit wheel `packages`, without build-level `packages`,
+  or build- or wheel-level `force-include`, `sources` or `only-include`.
+- `maturin`: explicit `python-source` and `module-name`, without
+  `python-packages`.
+
+Other layouts and backends, including Flit, are `api_unknown`; declarations
+never fall back to the name heuristic. An unknown layout at either revision
+is not checked. Planning with API checks disabled refuses publishable packages
+unless `--allow-unchecked-publishable` is supplied.
+
 ## What it owns and what it delegates
 
 | Concern | Owner |
