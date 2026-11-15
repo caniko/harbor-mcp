@@ -429,47 +429,29 @@ fn checks_setuptools_namespace_packages() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     git(&tmp, &["init", "-q", "-b", "trunk"]);
-    // A distribution whose own directory is a PEP 420 namespace under
-    // `packages.find`, and a dotted package declared under `package-dir`.
+    // A dotted package declared under `package-dir`; it has no
+    // `__init__.py`, so only the declaration can locate it.
     write(
         &tmp,
-        "found/pyproject.toml",
-        "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools.packages.find]\nnamespaces = true\n",
-    );
-    write(&tmp, "found/src/shapes/core.py", "def old():\n    pass\n");
-    write(
-        &tmp,
-        "declared/pyproject.toml",
+        "pyproject.toml",
         "[project]\nname = \"gadget-dist\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools]\npackages = [\"ns.gadget\"]\npackage-dir = {\"\" = \"lib\"}\n",
     );
-    write(
-        &tmp,
-        "declared/lib/ns/gadget/mod.py",
-        "def old():\n    pass\n",
-    );
+    write(&tmp, "lib/ns/gadget/mod.py", "def old():\n    pass\n");
     git(&tmp, &["add", "-A"]);
     git(&tmp, &["commit", "-qm", "feat: initial"]);
-    git(&tmp, &["tag", "shapes/v1.0.0"]);
-    git(&tmp, &["tag", "gadget-dist/v1.0.0"]);
-    write(&tmp, "found/src/shapes/core.py", "def keep():\n    pass\n");
-    write(
-        &tmp,
-        "declared/lib/ns/gadget/mod.py",
-        "def keep():\n    pass\n",
-    );
-    git(&tmp, &["commit", "-qam", "fix: drop public names"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    write(&tmp, "lib/ns/gadget/mod.py", "def keep():\n    pass\n");
+    git(&tmp, &["commit", "-qam", "fix: drop old"]);
     let repo = tmp.to_str().unwrap();
 
     let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
-    for id in ["pypi:shapes", "pypi:gadget-dist"] {
-        let p = entry(&plan, id);
-        assert_eq!(p["api_checked"], true, "{p}");
-        assert_eq!(
-            (p["level"].as_str(), p["next"].as_str()),
-            (Some("major"), Some("2.0.0")),
-            "{p}"
-        );
-    }
+    let gadget = entry(&plan, "pypi:gadget-dist");
+    assert_eq!(gadget["api_checked"], true, "{gadget}");
+    assert_eq!(
+        (gadget["level"].as_str(), gadget["next"].as_str()),
+        (Some("major"), Some("2.0.0")),
+        "{gadget}"
+    );
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
@@ -642,6 +624,264 @@ fn refuses_pure_rust_maturin_projects() {
     ]))
     .unwrap();
     assert_eq!(entry(&plan, "pypi:widget-ext")["api_checked"], false);
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn refuses_setuptools_package_discovery() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-find-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    // `packages.find` discovers packages from the tree, which harbor-mcp does
+    // not emulate: even a directory the heuristic could match stays unknown.
+    write(
+        &tmp,
+        "pyproject.toml",
+        "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools.packages.find]\nnamespaces = true\n",
+    );
+    write(&tmp, "src/shapes/__init__.py", "def stable():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    let repo = tmp.to_str().unwrap();
+
+    let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
+    assert!(err.contains("pypi:shapes"), "{err}");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn uses_declared_package_dir_over_the_name_heuristic() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-packagedir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    // The declared package under `lib/` shares the distribution's name; a
+    // same-named directory at the root must not be compared instead.
+    write(
+        &tmp,
+        "pyproject.toml",
+        "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools]\npackages = [\"shapes\"]\npackage-dir = {\"\" = \"lib\"}\n",
+    );
+    write(&tmp, "lib/shapes/__init__.py", "def old():\n    pass\n");
+    write(&tmp, "shapes/__init__.py", "def stable():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    write(&tmp, "lib/shapes/__init__.py", "def keep():\n    pass\n");
+    git(&tmp, &["commit", "-qam", "fix: drop old"]);
+    let repo = tmp.to_str().unwrap();
+
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    let shapes = entry(&plan, "pypi:shapes");
+    assert_eq!(shapes["api_checked"], true, "{shapes}");
+    assert_eq!(
+        (shapes["level"].as_str(), shapes["next"].as_str()),
+        (Some("major"), Some("2.0.0")),
+        "{shapes}"
+    );
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn refuses_poetry_glob_packages() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-poetry-glob-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    // A glob include names no single import.
+    write(
+        &tmp,
+        "pyproject.toml",
+        "[project]\nname = \"acme\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"poetry-core\"]\nbuild-backend = \"poetry.core.masonry.api\"\n\n[tool.poetry]\npackages = [{ include = \"acme-*\", from = \"src\" }]\n",
+    );
+    write(
+        &tmp,
+        "src/acme_core/__init__.py",
+        "def stable():\n    pass\n",
+    );
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    let repo = tmp.to_str().unwrap();
+
+    let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
+    assert!(err.contains("pypi:acme"), "{err}");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn skips_poetry_sdist_only_packages() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-poetry-format-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    // Two includes, one of them sdist-only: its removal is not an API change.
+    write(
+        &tmp,
+        "pyproject.toml",
+        "[project]\nname = \"acme\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"poetry-core\"]\nbuild-backend = \"poetry.core.masonry.api\"\n\n[tool.poetry]\npackages = [{ include = \"acme\", from = \"src\", format = [\"sdist\", \"wheel\"] }, { include = \"tests\", format = \"sdist\" }]\n",
+    );
+    write(&tmp, "src/acme/__init__.py", "def stable():\n    pass\n");
+    write(&tmp, "tests/helpers.py", "def old():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    write(&tmp, "tests/helpers.py", "def keep():\n    pass\n");
+    git(&tmp, &["commit", "-qam", "fix: drop a test helper"]);
+    let repo = tmp.to_str().unwrap();
+
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    let acme = entry(&plan, "pypi:acme");
+    assert_eq!(acme["api_checked"], true, "{acme}");
+    assert_eq!(
+        (acme["level"].as_str(), acme["next"].as_str()),
+        (Some("patch"), Some("1.0.1")),
+        "{acme}"
+    );
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn refuses_remapped_python_layouts() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-remap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    // A Hatch `sources` remap at the wheel target and at the build level, and
+    // a Poetry `to` remap, all move the import somewhere the declared name
+    // does not name.
+    write(
+        &tmp,
+        "hatch/pyproject.toml",
+        "[project]\nname = \"shapes\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[tool.hatch.build.targets.wheel]\npackages = [\"src/shapes\"]\nsources = {\"src\" = \"\"}\n",
+    );
+    write(
+        &tmp,
+        "hatch/src/shapes/__init__.py",
+        "def stable():\n    pass\n",
+    );
+    write(
+        &tmp,
+        "widemap/pyproject.toml",
+        "[project]\nname = \"gadget\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[tool.hatch.build]\nsources = {\"src\" = \"\"}\n\n[tool.hatch.build.targets.wheel]\npackages = [\"src/gadget\"]\n",
+    );
+    write(
+        &tmp,
+        "widemap/src/gadget/__init__.py",
+        "def stable():\n    pass\n",
+    );
+    write(
+        &tmp,
+        "poetry/pyproject.toml",
+        "[project]\nname = \"acme\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"poetry-core\"]\nbuild-backend = \"poetry.core.masonry.api\"\n\n[tool.poetry]\npackages = [{ include = \"acme\", from = \"src\", to = \"renamed\" }]\n",
+    );
+    write(
+        &tmp,
+        "poetry/src/acme/__init__.py",
+        "def stable():\n    pass\n",
+    );
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    let repo = tmp.to_str().unwrap();
+
+    let err = harbor_fail(&["plan", "--repo", repo, "--json", "--no-api-checks"]);
+    assert!(err.contains("pypi:shapes"), "{err}");
+    assert!(err.contains("pypi:gadget"), "{err}");
+    assert!(err.contains("pypi:acme"), "{err}");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn locates_hatch_packages_outside_src() {
+    let tmp = std::env::temp_dir().join(format!("harbor-mcp-hatch-lib-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    // The package directory names the import, not the distribution.
+    write(
+        &tmp,
+        "pyproject.toml",
+        "[project]\nname = \"shapes-dist\"\nversion = \"1.0.0\"\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[tool.hatch.build.targets.wheel]\npackages = [\"lib/shapes\"]\n",
+    );
+    write(&tmp, "lib/shapes/__init__.py", "def old():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    git(&tmp, &["tag", "v1.0.0"]);
+    write(&tmp, "lib/shapes/__init__.py", "def keep():\n    pass\n");
+    git(&tmp, &["commit", "-qam", "fix: drop old"]);
+    let repo = tmp.to_str().unwrap();
+
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    let shapes = entry(&plan, "pypi:shapes-dist");
+    assert_eq!(shapes["api_checked"], true, "{shapes}");
+    assert_eq!(
+        (shapes["level"].as_str(), shapes["next"].as_str()),
+        (Some("major"), Some("2.0.0")),
+        "{shapes}"
+    );
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn locates_poetry_default_packages() {
+    let tmp =
+        std::env::temp_dir().join(format!("harbor-mcp-poetry-default-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    git(&tmp, &["init", "-q", "-b", "trunk"]);
+    let poetry = "[build-system]\nrequires = [\"poetry-core\"]\nbuild-backend = \"poetry.core.masonry.api\"\n\n[tool.poetry]\n";
+    // The canonical project name as a directory, as a module, and under `src/`.
+    write(
+        &tmp,
+        "canonical/pyproject.toml",
+        &format!("[project]\nname = \"My--Shapes\"\nversion = \"1.0.0\"\n\n{poetry}"),
+    );
+    write(
+        &tmp,
+        "canonical/my_shapes/__init__.py",
+        "def old():\n    pass\n",
+    );
+    write(
+        &tmp,
+        "module/pyproject.toml",
+        &format!("[project]\nname = \"gadget\"\nversion = \"1.0.0\"\n\n{poetry}"),
+    );
+    write(&tmp, "module/gadget.py", "def old():\n    pass\n");
+    write(
+        &tmp,
+        "src/pyproject.toml",
+        &format!("[project]\nname = \"widget\"\nversion = \"1.0.0\"\n\n{poetry}"),
+    );
+    write(&tmp, "src/src/widget/__init__.py", "def old():\n    pass\n");
+    git(&tmp, &["add", "-A"]);
+    git(&tmp, &["commit", "-qm", "feat: initial"]);
+    for tag in ["My--Shapes/v1.0.0", "gadget/v1.0.0", "widget/v1.0.0"] {
+        git(&tmp, &["tag", tag]);
+    }
+    write(
+        &tmp,
+        "canonical/my_shapes/__init__.py",
+        "def keep():\n    pass\n",
+    );
+    write(&tmp, "module/gadget.py", "def keep():\n    pass\n");
+    write(
+        &tmp,
+        "src/src/widget/__init__.py",
+        "def keep():\n    pass\n",
+    );
+    git(&tmp, &["commit", "-qam", "fix: drop public names"]);
+    let repo = tmp.to_str().unwrap();
+
+    let plan: Value = serde_json::from_str(&harbor(&["plan", "--repo", repo, "--json"])).unwrap();
+    for id in ["pypi:my-shapes", "pypi:gadget", "pypi:widget"] {
+        let p = entry(&plan, id);
+        assert_eq!(p["api_checked"], true, "{p}");
+        assert_eq!(
+            (p["level"].as_str(), p["next"].as_str()),
+            (Some("major"), Some("2.0.0")),
+            "{p}"
+        );
+    }
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 

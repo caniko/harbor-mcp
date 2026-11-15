@@ -65,15 +65,19 @@ own.
 
 ## Python API targets
 
-`griffe check` compares every import the project declares: a flat or `src/`
-package, `setuptools` `py-modules`, PEP 420 namespace packages (an explicit
-`[tool.setuptools] packages` list, or `packages.find` with its default
-`namespaces`, and `package-dir = {"" = ...}`), Poetry `packages` (or its
-default package), Hatch wheel `packages`, and the Python package beside a
-mixed maturin project's extension under `python-source`. A project whose
-importable code none of these locate stays `api_unknown`, so planning it
-refuses without `--allow-unchecked-publishable`: a compiled-only maturin
-extension and an unrecognised layout cannot be read from source.
+`griffe check` compares what the project declares: an explicit `setuptools`
+`packages` list of dotted names (with `package-dir = {"" = ...}` or at the
+project root), `setuptools` `py-modules`, Poetry `packages` entries that apply
+to wheels (or Poetry's default canonical project name at the root or under
+`src/`), Hatch wheel `packages`, and the Python package beside a mixed maturin
+project's extension under `python-source`. When nothing is declared, a flat or
+`src/` package named after the distribution is the one assumed surface.
+
+Discovery that harbor-mcp does not emulate — `setuptools` `packages.find`, a
+per-prefix `package-dir`, glob or `to`-remapped Poetry includes, Hatch
+`sources`/`only-include`, and compiled-only maturin extensions — leaves
+`api_unknown`: planning refuses without `--allow-unchecked-publishable` rather
+than guess a layout or fall back to the name heuristic.
 
 ## What it owns and what it delegates
 

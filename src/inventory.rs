@@ -642,11 +642,39 @@ fn push_target(targets: &mut Vec<(String, String)>, search: String, import: Stri
     }
 }
 
+/// Poetry's canonical distribution name: lowercase, each run of `-`, `_` or
+/// `.` becomes one `_`.
+fn canonical(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if matches!(c, '-' | '_' | '.') {
+            if !out.ends_with('_') {
+                out.push('_');
+            }
+        } else {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// Whether a Poetry `format` (a string or an array) applies to wheels; an
+/// absent format covers every target.
+fn includes_wheel(entry: &toml::Value) -> bool {
+    match entry.get("format") {
+        None => true,
+        Some(toml::Value::String(format)) => format == "wheel",
+        Some(toml::Value::Array(formats)) => formats.iter().any(|f| f.as_str() == Some("wheel")),
+        Some(_) => false,
+    }
+}
+
 /// Importable code a Python project declares under `dir`, each with the search
-/// path it lives under: a flat or `src/` package, a `py-modules` module, and
-/// the package directories setuptools, Poetry, Hatch and maturin declare.
+/// path it lives under: what setuptools, Poetry, Hatch and maturin declare, or
+/// for a project that declares nothing, its own flat or `src/` package.
 /// `files` answers for the repository at whatever revision is inspected.
-/// Ambiguous layouts produce no target, so the package stays `api_unknown`.
+/// A declaration this cannot map exactly to one (search path, import) pair
+/// yields no target, so the package stays `api_unknown` rather than guessed.
 fn python_targets(dir: &str, doc: &toml::Table, files: &[String]) -> Vec<(String, String)> {
     let Some(project) = doc.get("project").and_then(|v| v.as_table()) else {
         return Vec::new();
@@ -656,116 +684,142 @@ fn python_targets(dir: &str, doc: &toml::Table, files: &[String]) -> Vec<(String
     };
     let tool = |key: &str| doc.get("tool").and_then(|t| t.get(key));
     let setuptools = tool("setuptools");
-    let roots = [join(dir, "src"), dir.to_owned()];
+    let maturin = tool("maturin");
     let import = name.replace(['-', '.'], "_").to_ascii_lowercase();
     let mut targets = Vec::new();
-    // A flat or `src/` package, and every single module.
-    let package = join(&import, "__init__.py");
-    if let Some(root) = roots.iter().find(|r| has_file(files, &join(r, &package))) {
-        push_target(&mut targets, root.clone(), import.clone());
-    }
-    for module in setuptools
-        .map(|t| strs(t.get("py-modules")))
-        .unwrap_or_default()
-    {
-        let file = format!("{module}.py");
-        if let Some(root) = roots.iter().find(|r| has_file(files, &join(r, &file))) {
-            push_target(&mut targets, root.clone(), module);
+    // Whether a backend declared which code it ships. A declaration replaces
+    // discovery from the tree entirely: the name heuristic below never fills
+    // in for it.
+    let mut declared = false;
+
+    // setuptools: `package-dir`'s `""` root, an explicit dotted `packages`
+    // list and `py-modules` map exactly. `packages.find` discovers packages
+    // from the tree and is not emulated, and a per-prefix `package-dir`
+    // mapping has no single search path.
+    if let Some(setuptools) = setuptools {
+        let mut root = dir.to_owned();
+        if let Some(package_dir) = setuptools.get("package-dir") {
+            declared = true;
+            let Some(map) = package_dir.as_table() else {
+                return Vec::new();
+            };
+            let Some(moved) = map
+                .get("")
+                .and_then(|v| v.as_str())
+                .filter(|_| map.keys().all(String::is_empty))
+            else {
+                return Vec::new();
+            };
+            root = join(dir, moved);
         }
-    }
-    // setuptools: an explicit `packages` list, or `packages.find` whose
-    // namespace lookup takes the distribution's own dotted directory.
-    if let Some(packages) = setuptools.and_then(|t| t.get("packages")) {
-        let mut roots = roots.to_vec();
-        // `package-dir = {"" = "<dir>"}` moves every package's root; a
-        // per-prefix mapping is left alone.
-        if let Some(moved) = setuptools
-            .and_then(|t| t.get("package-dir"))
-            .and_then(|t| t.get(""))
-            .and_then(|v| v.as_str())
-        {
-            roots.insert(0, join(dir, moved));
-        }
-        if let Some(list) = packages.as_array() {
+        if let Some(packages) = setuptools.get("packages") {
+            declared = true;
+            let Some(list) = packages.as_array() else {
+                return Vec::new();
+            };
             for import in list.iter().filter_map(|v| v.as_str()) {
-                // A pattern is a `find` input, not a package name.
-                if import.contains(['*', '?']) {
-                    continue;
+                if import.contains(['*', '?', '[']) {
+                    return Vec::new();
                 }
-                if let Some(root) = locate(&roots, import, files) {
-                    push_target(&mut targets, root, import.to_owned());
+                if let Some(search) = locate(std::slice::from_ref(&root), import, files) {
+                    push_target(&mut targets, search, import.to_owned());
                 }
-            }
-        } else if let Some(find) = packages.get("find") {
-            // `namespaces` defaults to true under `packages.find`: a directory
-            // without `__init__.py` is still the package.
-            if find.get("namespaces").and_then(|v| v.as_bool()) != Some(false)
-                && let Some(root) = locate(&roots, &import, files)
-            {
-                push_target(&mut targets, root, import.clone());
             }
         }
-    }
-    // Poetry: declared `packages` (an `include` directory or module under
-    // `from`), or its default package named after the project.
-    if let Some(poetry) = tool("poetry") {
-        match poetry.get("packages").and_then(|v| v.as_array()) {
-            Some(list) => {
-                for entry in list {
-                    let Some(include) = entry.get("include").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let from = entry.get("from").and_then(|v| v.as_str()).unwrap_or("");
-                    let root = normalize(&join(dir, from));
-                    if let Some(module) = include.strip_suffix(".py") {
-                        if has_file(files, &join(&root, include)) {
-                            push_target(&mut targets, root, module.replace('/', "."));
-                        }
-                    } else if has_python(files, &join(&root, include)) {
-                        push_target(&mut targets, root, include.replace('/', "."));
-                    }
-                }
-            }
-            None => {
-                if let Some(root) = locate(&roots, &import, files) {
-                    push_target(&mut targets, root, import.clone());
+        if let Some(modules) = setuptools.get("py-modules") {
+            declared = true;
+            let Some(list) = modules.as_array() else {
+                return Vec::new();
+            };
+            for module in list.iter().filter_map(|v| v.as_str()) {
+                if has_file(files, &join(&root, &format!("{module}.py"))) {
+                    push_target(&mut targets, root.clone(), module.to_owned());
                 }
             }
         }
     }
-    // Hatch: wheel `packages` naming one package directory under the project
-    // or its `src/`. Remapped and nested entries stay unknown.
-    if let Some(wheel) = tool("hatch")
-        .and_then(|t| t.get("build"))
+
+    // Poetry: `packages` entries including `include` under `from`. A glob or
+    // `to` remapping cannot be named, and an entry whose format leaves wheels
+    // out is not part of this API; with nothing left to compare the package
+    // stays unknown.
+    if let Some(poetry) = tool("poetry")
+        && let Some(packages) = poetry.get("packages")
+    {
+        declared = true;
+        let mut found = 0;
+        for entry in packages.as_array().into_iter().flatten() {
+            let Some(include) = entry.get("include").and_then(|v| v.as_str()) else {
+                return Vec::new();
+            };
+            if include.contains(['*', '?', '[']) || entry.get("to").is_some() {
+                return Vec::new();
+            }
+            if !includes_wheel(entry) {
+                continue;
+            }
+            let from = entry.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let root = normalize(&join(dir, from));
+            if let Some(module) = include.strip_suffix(".py") {
+                if has_file(files, &join(&root, include)) {
+                    push_target(&mut targets, root, module.replace('/', "."));
+                    found += 1;
+                }
+            } else if has_python(files, &join(&root, include)) {
+                push_target(&mut targets, root, include.replace('/', "."));
+                found += 1;
+            }
+        }
+        if found == 0 {
+            return Vec::new();
+        }
+    }
+
+    // Hatch: wheel `packages` names package directories anywhere under the
+    // project; the search path is the parent, the import the final component.
+    // A build-wide or wheel `sources`/`only-include` remap or selection cannot
+    // be named, so it leaves the package unchecked before any target is
+    // accepted.
+    let hatch = tool("hatch").and_then(|t| t.get("build"));
+    if let Some(build) = hatch
+        && (build.get("sources").is_some() || build.get("only-include").is_some())
+    {
+        return Vec::new();
+    }
+    if let Some(wheel) = hatch
         .and_then(|t| t.get("targets"))
         .and_then(|t| t.get("wheel"))
     {
-        for entry in strs(wheel.get("packages")) {
-            let entry = normalize(&entry);
-            let root = match entry.rsplit_once('/') {
-                Some((parent, _)) => normalize(&join(dir, parent)),
-                None => dir.to_owned(),
-            };
-            if root != dir && root != join(dir, "src") {
-                continue;
-            }
-            let Some(name) = entry.rsplit('/').next() else {
-                continue;
-            };
-            if has_python(files, &join(&root, name)) {
-                push_target(&mut targets, root, name.to_owned());
+        if wheel.get("sources").is_some() || wheel.get("only-include").is_some() {
+            return Vec::new();
+        }
+        if let Some(packages) = wheel.get("packages") {
+            declared = true;
+            for entry in strs(Some(packages)) {
+                let entry = normalize(&entry);
+                let (root, name) = match entry.rsplit_once('/') {
+                    Some((parent, name)) => (normalize(&join(dir, parent)), name),
+                    None => (dir.to_owned(), entry.as_str()),
+                };
+                if name.ends_with(".py") {
+                    return Vec::new();
+                }
+                if has_python(files, &join(&root, name)) {
+                    push_target(&mut targets, root, name.to_owned());
+                }
             }
         }
     }
+
     // maturin: the Python package beside the compiled extension under
     // `python-source`, named by `module-name`'s first component or the project.
-    if let Some(source) = tool("maturin")
-        .and_then(|t| t.get("python-source"))
-        .and_then(|v| v.as_str())
+    if let Some(maturin) = maturin
+        && let Some(source) = maturin.get("python-source").and_then(|v| v.as_str())
     {
+        declared = true;
         let root = normalize(&join(dir, source));
-        let package = tool("maturin")
-            .and_then(|t| t.get("module-name"))
+        let package = maturin
+            .get("module-name")
             .and_then(|v| v.as_str())
             .map_or_else(
                 || import.clone(),
@@ -775,8 +829,31 @@ fn python_targets(dir: &str, doc: &toml::Table, files: &[String]) -> Vec<(String
             push_target(&mut targets, root, package);
         }
     }
-    // A pure-Rust maturin project has no Python sources; griffe cannot inspect
-    // a compiled module from source, so it stays api_unknown.
+
+    // Nothing declared: the project's own import is the one surface its build
+    // backend is assumed to ship. Poetry's default package is the canonical
+    // project name, at the root as a directory or module, else under `src/`.
+    // A pure-Rust maturin extension declares nothing and stays unknown: griffe
+    // cannot inspect a compiled module from source.
+    if !declared {
+        if tool("poetry").is_some() {
+            let name = canonical(name);
+            let package = join(dir, &name);
+            if has_python(files, &package) || has_file(files, &format!("{package}.py")) {
+                push_target(&mut targets, dir.to_owned(), name.clone());
+            } else if has_python(files, &join(dir, &join("src", &name))) {
+                push_target(&mut targets, join(dir, "src"), name);
+            }
+        } else {
+            let package = join(&import, "__init__.py");
+            if let Some(root) = [join(dir, "src"), dir.to_owned()]
+                .iter()
+                .find(|root| has_file(files, &join(root, &package)))
+            {
+                push_target(&mut targets, root.clone(), import.clone());
+            }
+        }
+    }
     targets
 }
 
