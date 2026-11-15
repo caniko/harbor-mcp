@@ -63,6 +63,18 @@ For every package it finds:
 The plan lists packages dependencies-first and names the steps other tools
 own.
 
+## Python API targets
+
+`griffe check` compares every import the project declares: a flat or `src/`
+package, `setuptools` `py-modules`, PEP 420 namespace packages (an explicit
+`[tool.setuptools] packages` list, or `packages.find` with its default
+`namespaces`, and `package-dir = {"" = ...}`), Poetry `packages` (or its
+default package), Hatch wheel `packages`, and the Python package beside a
+mixed maturin project's extension under `python-source`. A project whose
+importable code none of these locate stays `api_unknown`, so planning it
+refuses without `--allow-unchecked-publishable`: a compiled-only maturin
+extension and an unrecognised layout cannot be read from source.
+
 ## What it owns and what it delegates
 
 | Concern | Owner |
