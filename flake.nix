@@ -5,6 +5,10 @@
   # component and its lock-alignment check compares these pins.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/8edc0c72e3a38faf5434e40d1f19431125fe4b30";
+    harbor-meta = {
+      url = "github:caniko/harbor-meta/b494b56e8174557b27956108d3ed7dd0e6425d0b";
+      flake = false;
+    };
     harbor-rs = {
       url = "github:caniko/harbor-rs/82206bdc5be73b81992917ce765073db0f446f01";
       flake = false;
@@ -64,18 +68,17 @@
         '';
         meta.mainProgram = "harbor-mcp";
       };
-      format = inputs.treefmt-nix.lib.evalModule pkgs {
-        projectRootFile = "flake.nix";
-        # simit owns workflow serialization.
-        settings.excludes = [".github/workflows/*.yaml"];
-        programs.rustfmt = {
-          enable = true;
-          package = toolchain.rustToolchain;
-          edition = "2024";
+      treefmtArgs = {
+        harbor-meta.treefmtModules = {
+          nix = "${inputs.harbor-meta}/nix/treefmt/nix.nix";
+          toml = "${inputs.harbor-meta}/nix/treefmt/toml.nix";
         };
-        programs.alejandra.enable = true;
-        programs.taplo.enable = true;
+        harbor-rs.treefmtModules.rust = "${inputs.harbor-rs}/nix/treefmt/rust.nix";
+        rustfmtPackage = toolchain.rustToolchain;
       };
+      format = inputs.treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix {
+        inherit (treefmtArgs) harbor-meta harbor-rs rustfmtPackage;
+      });
     in {
       packages = {
         default = package;
