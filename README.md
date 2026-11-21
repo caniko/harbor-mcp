@@ -39,13 +39,13 @@ For every package it finds:
    - API comparison against the baseline: `cargo semver-checks` for Cargo
      libraries, `griffe check` for Python packages. Both run only for
      packages that publish and changed.
-   Skipping API checks (`--no-api-checks`, MCP `apiChecks: false`) refuses to
-   plan publishable units with a public API, since commit markers alone can
-   miss a removed public item; a package configured `api_check = false` makes
-   that choice explicitly and is exempt. `--allow-unchecked-publishable` (MCP
-   `allowUncheckedPublishable: true`) plans them anyway, marking entries
-   `api_checked: false` and a `api not checked (<reason>)` line in the text
-   plan.
+     Skipping API checks (`--no-api-checks`, MCP `apiChecks: false`) refuses to
+     plan publishable units with a public API, since commit markers alone can
+     miss a removed public item; a package configured `api_check = false` makes
+     that choice explicitly and is exempt. `--allow-unchecked-publishable` (MCP
+     `allowUncheckedPublishable: true`) plans them anyway, marking entries
+     `api_checked: false` and a `api not checked (<reason>)` line in the text
+     plan.
 3. **Release units.** Packages that share a version source (Cargo
    `version.workspace = true`) or `follow` another package move together at
    the strongest member's level.
@@ -85,27 +85,27 @@ unless `--allow-unchecked-publishable` is supplied.
 
 ## What it owns and what it delegates
 
-| Concern | Owner |
-| --- | --- |
-| Cross-repository package graph, baselines, level, propagation, ordering, pre-1.0 rules, anchors, version edits | harbor-mcp |
-| Rust public-API breakage | [cargo-semver-checks](https://github.com/obi1kenobi/cargo-semver-checks) |
-| Python public-API breakage | [griffe](https://mkdocstrings.github.io/griffe/) `check` |
-| Changelog, release commit, signed tag, crates.io/PyPI publishing, workspace publish order | [simit](https://github.com/caniko/simit) (`simit release`, `simit release plan`) or the repository's own release tool |
-| Lockfiles | `cargo update --workspace`, `uv lock` |
-| Moving flake-input pins in consuming repositories | Fleetix supply graph (`fleetix_supply_consumers`, `fleetix_supply_land`) and Canix's pin train |
+| Concern                                                                                                        | Owner                                                                                                                 |
+| -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Cross-repository package graph, baselines, level, propagation, ordering, pre-1.0 rules, anchors, version edits | harbor-mcp                                                                                                            |
+| Rust public-API breakage                                                                                       | [cargo-semver-checks](https://github.com/obi1kenobi/cargo-semver-checks)                                              |
+| Python public-API breakage                                                                                     | [griffe](https://mkdocstrings.github.io/griffe/) `check`                                                              |
+| Changelog, release commit, signed tag, crates.io/PyPI publishing, workspace publish order                      | [simit](https://github.com/caniko/simit) (`simit release`, `simit release plan`) or the repository's own release tool |
+| Lockfiles                                                                                                      | `cargo update --workspace`, `uv lock`                                                                                 |
+| Moving flake-input pins in consuming repositories                                                              | Fleetix supply graph (`fleetix_supply_consumers`, `fleetix_supply_land`) and Canix's pin train                        |
 
 harbor-mcp never commits, tags, publishes or deposits archives.
 
 ## MCP tools
 
-| Tool | Effect |
-| --- | --- |
-| `inventory` | Packages, versions, baselines, units, dependencies, anchors and drift. Reads no history. |
-| `plan` | The full bump plan. Read-only. |
-| `apply` | Writes a plan's edits. Lists them unless `write: true`. Refuses if a repository moved past the plan or a touched file is dirty. |
+| Tool        | Effect                                                                                                                          |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `inventory` | Packages, versions, baselines, units, dependencies, anchors and drift. Reads no history.                                        |
+| `plan`      | The full bump plan. Read-only.                                                                                                  |
+| `apply`     | Writes a plan's edits. Lists them unless `write: true`. Refuses if a repository moved past the plan or a touched file is dirty. |
 
 ```json
-{"mcpServers": {"harbor-mcp": {"command": "harbor-mcp", "args": ["mcp"]}}}
+{ "mcpServers": { "harbor-mcp": { "command": "harbor-mcp", "args": ["mcp"] } } }
 ```
 
 ## Configuration
